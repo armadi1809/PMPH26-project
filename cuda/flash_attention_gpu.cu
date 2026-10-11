@@ -127,7 +127,7 @@ s2mm_kernel(int N, int d, const float* Q, const float* K, const float* V, float*
     // K[block_col*BN : block_col*(BN+1)][bidx : bidx + BN]
 #if 0
       for (int offset = 0; offset < BN; offset += stride_inp) {
-        shared_K[row_idx*(BN+1) + thread_col_inp] = ptr_K[row_idx*d + thread_col_inp];
+        shared_K[(thread_row_inp + offset) * (BN+1) + thread_col_inp] = ptr_K[(thread_row_inp + offset) * N + thread_col_inp];
       }
 #else
       {
