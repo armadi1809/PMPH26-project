@@ -1,8 +1,6 @@
 cuda/flash_attention_gpu
-cuda/results/
 futhark/build/
 futhark/data/
-futhark/results/
 futhark/custom-alg1-opt
 futhark/custom-alg1-opt.c
 futhark/custom-alg1-opt.h
