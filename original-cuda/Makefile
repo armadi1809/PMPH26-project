@@ -22,7 +22,7 @@ all: compile
 
 compile: $(EXEC)
 
-$(EXEC): $(SRC) Makefile
+$(EXEC): $(SRC) ../utils/utils.cuh Makefile
 	$(NVCC) $(NVCCFLAGS) -o $@ $(SRC)
 
 run: compile
