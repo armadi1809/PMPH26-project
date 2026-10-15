@@ -7,6 +7,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdbool.h>
+#include <stdint.h>
 #include <string.h>
 #include <math.h>
 #include <errno.h>
@@ -31,6 +32,42 @@ static bool parse_positive_int(const char *text, int *value) {
         return false;
     *value = (int)parsed;
     return true;
+}
+
+static bool read_futhark_f32(FILE *f, float *dst, size_t cnt, int rank) {
+    char head[7];
+    int64_t dims[3];
+    size_t total = 1;
+    if (fread(head, 1, 7, f) != 7 || memcmp(head, "b\x02", 2) != 0 ||
+        head[2] != rank || memcmp(head + 3, " f32", 4) != 0 ||
+        fread(dims, sizeof(int64_t), rank, f) != (size_t)rank)
+        return false;
+    for (int i = 0; i < rank; i++)
+        total *= (size_t)dims[i];
+    return total == cnt && fread(dst, sizeof(float), cnt, f) == cnt;
+}
+
+static bool read_inputs(const char *path, float *Q, float *K, float *V, size_t cnt) {
+    FILE *f = fopen(path, "rb");
+    if (f == NULL)
+        return false;
+    bool ok = read_futhark_f32(f, Q, cnt, 3) &&
+              read_futhark_f32(f, K, cnt, 2) &&
+              read_futhark_f32(f, V, cnt, 2);
+    fclose(f);
+    return ok;
+}
+
+static bool write_output(const char *path, const float *O, int N, int d) {
+    FILE *f = fopen(path, "wb");
+    if (f == NULL)
+        return false;
+    int64_t dims[3] = {N / d, d, d};
+    size_t cnt = (size_t)N * (size_t)d;
+    bool ok = fwrite("b\x02\x03 f32", 1, 7, f) == 7 &&
+              fwrite(dims, sizeof(int64_t), 3, f) == 3 &&
+              fwrite(O, sizeof(float), cnt, f) == cnt;
+    return fclose(f) == 0 && ok;
 }
 
 
@@ -392,16 +429,19 @@ int main(int argc, char **argv)
     float *Q, *K, *V, *O, dur;
     int N, d, runs = GPU_RUNS;
     int status = EXIT_SUCCESS;
+    const char *in_path = argc == 6 ? argv[4] : NULL;
+    const char *out_path = argc == 6 ? argv[5] : NULL;
 
-    if (argc != 3 && argc != 4) {
+    if (argc != 3 && argc != 4 && argc != 6) {
         fprintf(stderr, "Usage:\n");
         fprintf(stderr, "  %s d N [runs] Compute with matrices filled with ones\n", argv[0]);
+        fprintf(stderr, "  %s d N runs in out Read Q, K, V from Futhark binary in, write O to out\n", argv[0]);
         return EXIT_FAILURE;
     }
 
     if (!parse_positive_int(argv[1], &d) ||
         !parse_positive_int(argv[2], &N) ||
-        (argc == 4 && !parse_positive_int(argv[3], &runs))) {
+        (argc >= 4 && !parse_positive_int(argv[3], &runs))) {
         fprintf(stderr, "d, N, and runs must be positive integers no greater than %d.\n", INT_MAX);
         return EXIT_FAILURE;
     }
@@ -434,8 +474,15 @@ int main(int argc, char **argv)
     if ((O = (float*)calloc(cnt, sizeof(float))) == NULL)
         goto mem_failure;
 
-    for (size_t i = 0; i < cnt; i++) {
-        Q[i] = K[i] = V[i] = 1;
+    if (in_path != NULL) {
+        if (!read_inputs(in_path, Q, K, V, cnt)) {
+            fprintf(stderr, "Failed to read %zu floats per matrix from %s.\n", cnt, in_path);
+            return EXIT_FAILURE;
+        }
+    } else {
+        for (size_t i = 0; i < cnt; i++) {
+            Q[i] = K[i] = V[i] = 1;
+        }
     }
 
     fprintf(stderr, "done.\n");
@@ -485,12 +532,19 @@ int main(int argc, char **argv)
         gpuAssert(cudaMemcpy(O, O_d, cnt*sizeof(float), cudaMemcpyDeviceToHost));
         gpuAssert(cudaDeviceSynchronize());
 
-        fprintf(stderr, "L2 norm is %lf (should be %lf)\n", L2(O, cnt), sqrt(cnt));
-        for (size_t i = 0; i < cnt; i++) {
-            if (!isfinite(O[i]) || fabsf(O[i] - 1.0f) > 1e-3f) {
-                fprintf(stderr, "Output check failed at element %zu: expected 1, got %g.\n", i, O[i]);
+        if (out_path != NULL) {
+            if (!write_output(out_path, O, N, d)) {
+                fprintf(stderr, "Failed to write output to %s.\n", out_path);
                 status = EXIT_FAILURE;
-                break;
+            }
+        } else {
+            fprintf(stderr, "L2 norm is %lf (should be %lf)\n", L2(O, cnt), sqrt(cnt));
+            for (size_t i = 0; i < cnt; i++) {
+                if (!isfinite(O[i]) || fabsf(O[i] - 1.0f) > 1e-3f) {
+                    fprintf(stderr, "Output check failed at element %zu: expected 1, got %g.\n", i, O[i]);
+                    status = EXIT_FAILURE;
+                    break;
+                }
             }
         }
 
