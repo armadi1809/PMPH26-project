@@ -28,7 +28,6 @@ float* allocate_host_memory(size_t cnt) {
 
 
 template <int Br, int Bc, int mul>
-// __global__ void __launch_bounds__((Br * Bc) / (Tile_r * Tile_c), 1) // TODO: check if we need something else
 __global__ void __launch_bounds__(Br * Bc) s2mm_kernel(int N, int d, const float* Q, const float* K, const float* V, float* O, float *m, float*l) {
     int tx = threadIdx.x;
     int bx = blockIdx.x;
@@ -37,7 +36,6 @@ __global__ void __launch_bounds__(Br * Bc) s2mm_kernel(int N, int d, const float
     int Tr = CEIL_DIV(N, Br);
     int Tc = CEIL_DIV(N, Bc);
 
-    // Single head: blocks split the row tiles i, all read the same Q, K, V.
     int qkv_off = 0;
     int lm_off = 0;
 
@@ -47,16 +45,52 @@ __global__ void __launch_bounds__(Br * Bc) s2mm_kernel(int N, int d, const float
     float* Vj = Kj + Bc * d;
     float* Sij = Vj + Bc * d;
     float* Oi = Sij + Br * Bc;
+
     float* li = Oi + Br * d;
     float* li_new = li + Br;
+
     float* mi = li_new + Br;
     float* mi_new = mi + Br;
     float* mij_dash = mi_new + Br;
 
+    int i = blockIdx.x;
+
+    // load Q_i
+    const int elem_loads_per_thread_Q = CEIL_DIV(Br * d, Br * Bc);
+    const int elem_loads_per_thread_KV = CEIL_DIV(Bc * d, Br * Bc);
+
+    for (int e = 0; e < elem_loads_per_thread_Q; e++) {
+        int idx = e * (Br * Bc) + tx;
+        if (idx < Br * d) {
+            int row = idx / d;
+            int col = idx % d;
+            if (i * Br + row < N) {
+                Qi[row * d + col] = Q[qkv_off + (i * Br + row) * d + col];
+            }
+        }
+    }
+
+    // set O, m, l
+    const int num_threads = blockDim.x;
+
+    for (int t = threadIdx.x; t < Br * d; t += num_threads)
+        Oi[t] = 0.f;
+
+    for (int t = threadIdx.x; t < Br; t += num_threads) {
+        mi[t] = -INFINITY;
+        li[t] = 0.f;
+    }
+
+    __syncthreads();
+
+    const int s_row = tx / Bc;
+    const int s_col = tx % Bc;
+
+
     for (int j = 0; j < Tc; j++) {
         __syncthreads();
-        int loads_per_thread = CEIL_DIV(d, Br);
-        for (int e = 0; e < loads_per_thread; e++) {
+
+        for (int e = 0; e < elem_loads_per_thread_KV; e++) {
             int idx = e * (Br * Bc) + tx;
             if (idx < Bc * d) {
                 int row = idx / d;
@@ -70,77 +104,65 @@ __global__ void __launch_bounds__(Br * Bc) s2mm_kernel(int N, int d, const float
         }
         __syncthreads();
 
-        for (int i = bx; i < Tr; i += gridDim.x) {
-            for (int e = 0; e < loads_per_thread; e++) {
-                int idx = e * (Br * Bc) + tx;
-                if (idx < Br * d) {
-                    int row = idx / d;
-                    int col = idx % d;
-                    if (i * Br + row < N) {
-                        Qi[row * d + col] = Q[qkv_off + (i * Br + row) * d + col];
-                        Oi[row * d + col] = j == 0 ? 0.f : O[qkv_off + (i * Br + row) * d + col];
-                    }
+        float acc = 0.f;
+        for (int k = 0; k < d; k++)
+            acc += Qi[s_row * d + k] * Kj[s_col * d + k];
+
+        if (j * Bc + s_col >= N)
+            acc = -INFINITY;
+
+        Sij[s_row * Bc + s_col] = acc;
+        __syncthreads();
+
+        if (s_col == 0) {
+            float row_m = -INFINITY, row_l = 0.f;
+            // Find max for numerical stability
+            for (int c = 0; c < Bc; c++) {
+                float val = Sij[s_row * Bc + c];
+                if (val > row_m) {
+                    row_m = val;
                 }
             }
-        
-            int s_row = tx / Bc;
-            int s_col = tx % Bc;
-
-            if (s_col == 0) {
-                mi[s_row] = j == 0 ? -INFINITY : m[lm_off + (i * Br) + s_row];
-                li[s_row] = j == 0 ? 0.f : l[lm_off + (i * Br) + s_row];
-            }
-            __syncthreads();
-
-            float acc = 0.f;
-            for (int k = 0; k < d; k++)
-                acc += Qi[s_row * d + k] * Kj[s_col * d + k];
-
-            Sij[s_row * Bc + s_col] = acc;
-            __syncthreads();
-
-            if (s_col == 0) {
-                float row_m = -INFINITY, row_l = 0.f;
-                // Find max for numerical stability
-                for (int c = 0; c < Bc; c++) {
-                    float val = Sij[s_row * Bc + c];
-                    if (val > row_m) {
-                        row_m = val;
-                    }
-                }
-                // Compute exponentials and sum
-                for (int c = 0; c < Bc; c++) {
-                    float exp_val = expf(Sij[s_row * Bc + c] - row_m);
-                    Sij[s_row * Bc + c] = exp_val;
-                    row_l += exp_val;
-                }
-
-                // Update running max and sum
-                mij_dash[s_row] = row_m;
-                mi_new[s_row] = max(mi[s_row], row_m);
-                li_new[s_row] = expf(mi[s_row] - mi_new[s_row]) * li[s_row] + 
-                                expf(row_m - mi_new[s_row]) * row_l;
-            }
-            __syncthreads();
-
-            for (int col = s_col; col < d; col += Bc) {
-                float acc = 0.f;
-                for (int c = 0; c < Bc; c++)
-                    acc += Sij[s_row * Bc + c] * Vj[c * d + col];
-
-                int global_row = (i * Br) + s_row;
-                if (global_row < N) {
-                    Oi[s_row * d + col] = (1 / li_new[s_row]) * 
-                        ((li[s_row] * expf(mi[s_row] - mi_new[s_row]) * Oi[s_row * d + col]) + 
-                         (expf(mij_dash[s_row] - mi_new[s_row]) * acc));
-                    O[qkv_off + global_row * d + col] = Oi[s_row * d + col];
-                }
+            // Compute exponentials and sum
+            for (int c = 0; c < Bc; c++) {
+                float exp_val = expf(Sij[s_row * Bc + c] - row_m);
+                Sij[s_row * Bc + c] = exp_val;
+                row_l += exp_val;
             }
 
-            m[lm_off + (i * Br) + s_row] = mi_new[s_row];
-            l[lm_off + (i * Br) + s_row] = li_new[s_row];
-            __syncthreads();
+            // Update running max and sum
+            mij_dash[s_row] = row_m;
+            mi_new[s_row] = max(mi[s_row], row_m);
+            li_new[s_row] = expf(mi[s_row] - mi_new[s_row]) * li[s_row] + 
+                            expf(row_m - mi_new[s_row]) * row_l;
         }
+        __syncthreads();
+
+        for (int col = s_col; col < d; col += Bc) {
+            float acc = 0.f;
+            for (int c = 0; c < Bc; c++)
+                acc += Sij[s_row * Bc + c] * Vj[c * d + col];
+
+            int global_row = (i * Br) + s_row;
+            if (global_row < N) {
+                Oi[s_row * d + col] = (1 / li_new[s_row]) * 
+                    ((li[s_row] * expf(mi[s_row] - mi_new[s_row]) * Oi[s_row * d + col]) + 
+                     (expf(mij_dash[s_row] - mi_new[s_row]) * acc));
+            }
+        }
+
+        __syncthreads();
+
+        if (s_col == 0) {
+            mi[s_row] = mi_new[s_row];
+            li[s_row] = li_new[s_row];
+        }
+    }
+
+    for (int t = tx; t < Br * d; t += num_threads) {
+        int row = t / d;
+        if (i * Br + row < N)
+            O[qkv_off + (i * Br) * d + t] = Oi[t];
     }
 }
 
@@ -183,6 +205,7 @@ s2mm(float* m_d, float* l_d, float *O_d, float *Q_d, float *K_d, float *V_d, int
     const int M = 164 * 1024;    
     const int Br = std::min(CEIL_DIV(M, 4 * d), d);
     const int Bc = CEIL_DIV(M, 4 *d);
+    // Tr blocks!
 
 
     if(d == 128) {
