@@ -15,7 +15,7 @@
 #include "../utils/utils.cuh"
 
 #define GPU_RUNS 50
-
+#define CEIL_DIV(x, y) ((x) >= 0 ? (((x) + (y) - 1) / (y)) : ((x) / (y)))
 
 float* allocate_host_memory(size_t cnt) {
     float * ptr;
@@ -27,102 +27,125 @@ float* allocate_host_memory(size_t cnt) {
 }
 
 
-template <int Br, int Bc, int Tile_r, int Tile_c, int mul>
-__global__ void __launch_bounds__((Br * Bc) / (Tile_r * Tile_c), 1) // TODO: check if we need something else
-s2mm_kernel(int N, int d, const float* Q, const float* K, const float* V, float* O, float* ms) {
-    // Shared memory
-    extern __shared__ float shared_memory[];
-    float* shared_Q = shared_memory;
-    float* shared_K = shared_memory + Br * Bc * mul;
-    float* shared_P = shared_K + Br * (Bc+1);
-    float* shared_V = shared_K; // TODO: decide if to reuse K memory for V
+template <int Br, int Bc, int mul>
+// __global__ void __launch_bounds__((Br * Bc) / (Tile_r * Tile_c), 1) // TODO: check if we need something else
+__global__ void __launch_bounds__(Br * Bc) s2mm_kernel(int N, int d, const float* Q, const float* K, const float* V, float* O, float *m, float*l) {
+    int tx = threadIdx.x;
+    int bx = blockIdx.x;
+    int by = blockIdx.y;
 
-    float* maxs = shared_P + Br * Bc;   // [Br]
-    float* sums = maxs + Br;            // [Br]
-    float* es   = sums + Br;            // [Br]
-    float* el   = es   + Br;            // [Br]
-    float* li   = el   + Br;            // [Br]
-    float* mi   = li   + Br;            // [Br]
+    int Tr = CEIL_DIV(N, Br);
+    int Tc = CEIL_DIV(N, Bc);
 
-    const int block_size = Br * Bc;
-    const int tile_size = Tile_r * Tile_c;
-    const int num_threads = block_size / tile_size;
+    // Single head: blocks split the row tiles i, all read the same Q, K, V.
+    int qkv_off = 0;
+    int lm_off = 0;
 
-    for (int t = threadIdx.x; t < Br; t+=num_threads) {
-        mi[t] = -INFINITY;
-        li[t] = 0;
-    }
+    extern __shared__ float smem[];
+    float* Qi = smem;
+    float* Kj = Qi + Br * d;
+    float* Vj = Kj + Bc * d;
+    float* Sij = Vj + Bc * d;
+    float* Oi = Sij + Br * Bc;
+    float* li = Oi + Br * d;
+    float* li_new = li + Br;
+    float* mi = li_new + Br;
+    float* mi_new = mi + Br;
+    float* mij_dash = mi_new + Br;
 
-    float reg_O[mul][Tile_r][Tile_c] = {0.0};
-    float reg_P[Tile_r][Tile_c] = {0.0};
-    
-    const float* ptr_Q;
-    const float* ptr_K;
-    const float* ptr_V;
-    float* ptr_O;
+    for (int j = 0; j < Tc; j++) {
+        __syncthreads();
+        int loads_per_thread = CEIL_DIV(d, Br);
+        for (int e = 0; e < loads_per_thread; e++) {
+            int idx = e * (Br * Bc) + tx;
+            if (idx < Bc * d) {
+                int row = idx / d;
+                int col = idx % d;
 
-    const int thread_row_inp = threadIdx.x / Br;
-    const int thread_col_inp = threadIdx.x % Br;
+                if (j * Bc + row < N) {
+                    Kj[row * d + col] = K[qkv_off + (j * Bc + row) * d + col];
+                    Vj[row * d + col] = V[qkv_off + (j * Bc + row) * d + col];
+                }
+            }
+        }
+        __syncthreads();
 
-    const int thread_row_out = threadIdx.x / (Br / Tile_r);
-    const int thread_col_out = threadIdx.x % (Br / Tile_r);
+        for (int i = bx; i < Tr; i += gridDim.x) {
+            for (int e = 0; e < loads_per_thread; e++) {
+                int idx = e * (Br * Bc) + tx;
+                if (idx < Br * d) {
+                    int row = idx / d;
+                    int col = idx % d;
+                    if (i * Br + row < N) {
+                        Qi[row * d + col] = Q[qkv_off + (i * Br + row) * d + col];
+                        Oi[row * d + col] = j == 0 ? 0.f : O[qkv_off + (i * Br + row) * d + col];
+                    }
+                }
+            }
+        
+            int s_row = tx / Bc;
+            int s_col = tx % Bc;
 
-    const int stride_inp = num_threads / Br;
-    const int block_row = blockIdx.x;
-    const int block_col = blockIdx.y;
+            if (s_col == 0) {
+                mi[s_row] = j == 0 ? -INFINITY : m[lm_off + (i * Br) + s_row];
+                li[s_row] = j == 0 ? 0.f : l[lm_off + (i * Br) + s_row];
+            }
+            __syncthreads();
 
-    ptr_Q = Q + block_row * Br * d;
-    float *ptr_shared_Q = shared_Q;
+            float acc = 0.f;
+            for (int k = 0; k < d; k++)
+                acc += Qi[s_row * d + k] * Kj[s_col * d + k];
 
-    // copy Q into shared memory from HBM
-    for (int i = threadIdx.x; i < Br * d; i += num_threads) { // TODO: maybe blockDim here?
-        ptr_shared_Q[i] = ptr_Q[i];
-    }
+            Sij[s_row * Bc + s_col] = acc;
+            __syncthreads();
 
-    ptr_K = K + block_col * Bc * d;
-    float *ptr_shared_K = shared_K;
+            if (s_col == 0) {
+                float row_m = -INFINITY, row_l = 0.f;
+                // Find max for numerical stability
+                for (int c = 0; c < Bc; c++) {
+                    float val = Sij[s_row * Bc + c];
+                    if (val > row_m) {
+                        row_m = val;
+                    }
+                }
+                // Compute exponentials and sum
+                for (int c = 0; c < Bc; c++) {
+                    float exp_val = expf(Sij[s_row * Bc + c] - row_m);
+                    Sij[s_row * Bc + c] = exp_val;
+                    row_l += exp_val;
+                }
 
-    // copy K into shared memory from HBM
-    for (int i = threadIdx.x; i < Bc * d; i+= num_threads) {
-        ptr_shared_K[i] = ptr_K[i];
-    }
+                // Update running max and sum
+                mij_dash[s_row] = row_m;
+                mi_new[s_row] = max(mi[s_row], row_m);
+                li_new[s_row] = expf(mi[s_row] - mi_new[s_row]) * li[s_row] + 
+                                expf(row_m - mi_new[s_row]) * row_l;
+            }
+            __syncthreads();
 
-    __syncthreads();
+            for (int col = s_col; col < d; col += Bc) {
+                float acc = 0.f;
+                for (int c = 0; c < Bc; c++)
+                    acc += Sij[s_row * Bc + c] * Vj[c * d + col];
 
-    int cols = (Bc / Tile_c);
-
-    int start_t_i = (threadIdx.x * Tile_c) / cols;
-    int start_t_j = (threadIdx.x * Tile_c) % cols;
-
-    // matrix multiply within tile
-    for (int t_i = start_t_i; t_i < start_t_i + Tile_r; t_i++) {
-        float t_max = 0.0;
-
-        for (int t_j = start_t_j; t_j < start_t_j + Tile_c; t_j++) {
-            // multiply vectors
-            for (int k = 0; k < Br; k++) {
-                reg_P[t_i][t_j] += ptr_shared_Q[t_i * d + k] * ptr_shared_K[t_j * d + k];
+                int global_row = (i * Br) + s_row;
+                if (global_row < N) {
+                    Oi[s_row * d + col] = (1 / li_new[s_row]) * 
+                        ((li[s_row] * expf(mi[s_row] - mi_new[s_row]) * Oi[s_row * d + col]) + 
+                         (expf(mij_dash[s_row] - mi_new[s_row]) * acc));
+                    O[qkv_off + global_row * d + col] = Oi[s_row * d + col];
+                }
             }
 
-            t_max = std::max(t_max, reg_P[t_i][t_j]);
+            m[lm_off + (i * Br) + s_row] = mi_new[s_row];
+            l[lm_off + (i * Br) + s_row] = li_new[s_row];
+            __syncthreads();
         }
-
-        float t_sum = 0.0;
-        for (int t_j = start_t_j; t_j < start_t_j + Tile_c; t_j++) {
-            t_sum += exp(reg_P[t_i][t_j] - t_max);
-        }
-
-        maxs[threadIdx.x / cols] = t_max;
-        sums[threadIdx.x / cols] = t_sum;
     }
-
-    // tile work should be done
-    __syncthreads();
 }
 
-
-template<int Br, int Bc, int Tile_r, int Tile_c, int mul>
-void setParamsAndCallKer(int N, int d, float *Q_d, float *K_d, float *V_d, float *O_d, float* m_d) {
+template<int Br, int Bc, int mul>
+void setParamsAndCallKer(int N, int d, float *Q_d, float *K_d, float *V_d, float *O_d, float* m_d, float*l_d) {
     // Assumptions: ( TN | BN ) && ( BN | d ) && ( TN^2 | BN ) && 
     //              ( (BN / TN^2) | BN ) && ( BN >= TN^2 ) && (BN | N)
     // TODO: come to this back later and fix it
@@ -134,22 +157,22 @@ void setParamsAndCallKer(int N, int d, float *Q_d, float *K_d, float *V_d, float
     // assert(assert1 && assert2 && assert3 && assert4 && assert5);
 
     const int block_size = Br * Bc;
-    const int tile_size = Tile_r * Tile_c;
 
-    dim3 grid(N / Br, N / Bc);
-    dim3 block(block_size / tile_size);
+    dim3 grid(N / Br);
+    dim3 block(Br * Bc);
     const size_t shmem_size = (
-        Br * Bc * mul + // shared_Q
-        Br * (Bc+1) +   // shared_K, shared_V
-        Br * Bc +       // shared_P
-        6*Br            // maxs, sums, es, el, li, mi
+        Br * d +        // Qi
+        2 * Bc * d +    // Kj, Vj
+        Br * Bc +       // Sij
+        Br * d +        // Oi
+        5 * Br          // li, li_new, mi, mi_new, mij_dash
     ) * sizeof(float);
 
     // printf("N %d, d %d, BN %d, Bd %d, TN %d, mul %d, shmem %d\n", N, d, BN, Bd, TN, mul, shmem_size);
 
-    gpuAssert(cudaFuncSetAttribute(s2mm_kernel<Br, Bc, Tile_r, Tile_c, mul>, cudaFuncAttributeMaxDynamicSharedMemorySize, shmem_size));
+    gpuAssert(cudaFuncSetAttribute(s2mm_kernel<Br, Bc, mul>, cudaFuncAttributeMaxDynamicSharedMemorySize, shmem_size));
 
-    s2mm_kernel<Br, Bc, Tile_r, Tile_c, mul><<<grid, block, shmem_size>>>(N, d, Q_d, K_d, V_d, O_d, m_d);
+    s2mm_kernel<Br, Bc, mul><<<grid, block, shmem_size>>>(N, d, Q_d, K_d, V_d, O_d, m_d, l_d);
     gpuAssert(cudaPeekAtLastError());
 }
 
@@ -157,26 +180,20 @@ __host__ int
 s2mm(float* m_d, float* l_d, float *O_d, float *Q_d, float *K_d, float *V_d, int N, int d)
 {
 
-    const int M = 164 * 1024;
+    const int M = 164 * 1024;    
+    const int Br = std::min(CEIL_DIV(M, 4 * d), d);
+    const int Bc = CEIL_DIV(M, 4 *d);
+
 
     if(d == 128) {
-        const int Br = std::min((M + (4 * d) - 1) / d, d);
-        const int Bc = (M + (4 * d) - 1) / d;
-        const int Tile_r = 2;
-        const int Tile_c = 2;
-
-        setParamsAndCallKer<Br, Bc, Tile_r, Tile_c,2>(N,d,Q_d,K_d,V_d,O_d,m_d);
+        setParamsAndCallKer<32,32,2>(N,d,Q_d,K_d,V_d,O_d,m_d, l_d);
     } else if (d == 64) {
-        const int Br = std::min((M + (4 * d) - 1) / d, d);
-        const int Bc = (M + (4 * d) - 1) / d;
-        const int Tile_r = 2;
-        const int Tile_c = 2;
-
-        setParamsAndCallKer<Br, Bc, Tile_r, Tile_c,1>(N,d,Q_d,K_d,V_d,O_d,m_d);
+        setParamsAndCallKer<32,32,1>(N,d,Q_d,K_d,V_d,O_d,m_d, l_d);
     } else {
         printf("Unsupported dataset, exiting!");
         exit(1);
     }
+
     // cudaDeviceSynchronize();
 
 #if 0
