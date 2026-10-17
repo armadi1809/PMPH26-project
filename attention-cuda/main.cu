@@ -1,4 +1,6 @@
+#include <algorithm>
 #include <assert.h>
+#include <cmath>
 #include <cstdlib>
 #include <stdio.h>
 #include <stdlib.h>
@@ -22,6 +24,178 @@ float* allocate_host_memory(size_t cnt) {
     }
 
     return ptr;
+}
+
+
+template <int Br, int Bc, int Tile_r, int Tile_c, int mul>
+__global__ void __launch_bounds__((Br * Bc) / (Tile_r * Tile_c), 1) // TODO: check if we need something else
+s2mm_kernel(int N, int d, const float* Q, const float* K, const float* V, float* O, float* ms) {
+    // Shared memory
+    extern __shared__ float shared_memory[];
+    float* shared_Q = shared_memory;
+    float* shared_K = shared_memory + Br * Bc * mul;
+    float* shared_P = shared_K + Br * (Bc+1);
+    float* shared_V = shared_K; // TODO: decide if to reuse K memory for V
+
+    float* maxs = shared_P + Br * Bc;   // [Br]
+    float* sums = maxs + Br;            // [Br]
+    float* es   = sums + Br;            // [Br]
+    float* el   = es   + Br;            // [Br]
+    float* li   = el   + Br;            // [Br]
+    float* mi   = li   + Br;            // [Br]
+
+    const int block_size = Br * Bc;
+    const int tile_size = Tile_r * Tile_c;
+    const int num_threads = block_size / tile_size;
+
+    for (int t = threadIdx.x; t < Br; t+=num_threads) {
+        mi[t] = -INFINITY;
+        li[t] = 0;
+    }
+
+    float reg_O[mul][Tile_r][Tile_c] = {0.0};
+    float reg_P[Tile_r][Tile_c] = {0.0};
+    
+    const float* ptr_Q;
+    const float* ptr_K;
+    const float* ptr_V;
+    float* ptr_O;
+
+    const int thread_row_inp = threadIdx.x / Br;
+    const int thread_col_inp = threadIdx.x % Br;
+
+    const int thread_row_out = threadIdx.x / (Br / Tile_r);
+    const int thread_col_out = threadIdx.x % (Br / Tile_r);
+
+    const int stride_inp = num_threads / Br;
+    const int block_row = blockIdx.x;
+    const int block_col = blockIdx.y;
+
+    ptr_Q = Q + block_row * Br * d;
+    float *ptr_shared_Q = shared_Q;
+
+    // copy Q into shared memory from HBM
+    for (int i = threadIdx.x; i < Br * d; i += num_threads) { // TODO: maybe blockDim here?
+        ptr_shared_Q[i] = ptr_Q[i];
+    }
+
+    ptr_K = K + block_col * Bc * d;
+    float *ptr_shared_K = shared_K;
+
+    // copy K into shared memory from HBM
+    for (int i = threadIdx.x; i < Bc * d; i+= num_threads) {
+        ptr_shared_K[i] = ptr_K[i];
+    }
+
+    __syncthreads();
+
+    int cols = (Bc / Tile_c);
+
+    int start_t_i = (threadIdx.x * Tile_c) / cols;
+    int start_t_j = (threadIdx.x * Tile_c) % cols;
+
+    // matrix multiply within tile
+    for (int t_i = start_t_i; t_i < start_t_i + Tile_r; t_i++) {
+        float t_max = 0.0;
+
+        for (int t_j = start_t_j; t_j < start_t_j + Tile_c; t_j++) {
+            // multiply vectors
+            for (int k = 0; k < Br; k++) {
+                reg_P[t_i][t_j] += ptr_shared_Q[t_i * d + k] * ptr_shared_K[t_j * d + k];
+            }
+
+            t_max = std::max(t_max, reg_P[t_i][t_j]);
+        }
+
+        float t_sum = 0.0;
+        for (int t_j = start_t_j; t_j < start_t_j + Tile_c; t_j++) {
+            t_sum += exp(reg_P[t_i][t_j] - t_max);
+        }
+
+        maxs[threadIdx.x / cols] = t_max;
+        sums[threadIdx.x / cols] = t_sum;
+    }
+
+    // tile work should be done
+    __syncthreads();
+}
+
+
+template<int Br, int Bc, int Tile_r, int Tile_c, int mul>
+void setParamsAndCallKer(int N, int d, float *Q_d, float *K_d, float *V_d, float *O_d, float* m_d) {
+    // Assumptions: ( TN | BN ) && ( BN | d ) && ( TN^2 | BN ) && 
+    //              ( (BN / TN^2) | BN ) && ( BN >= TN^2 ) && (BN | N)
+    // TODO: come to this back later and fix it
+    // bool assert1 = (BN % TN) == 0;
+    // bool assert2 = (d % BN)  == 0;
+    // bool assert3 = (BN % (TN*TN)) == 0;
+    // bool assert4 = (BN % (BN / (TN*TN)))  == 0;
+    // bool assert5 = (BN >= (TN*TN));
+    // assert(assert1 && assert2 && assert3 && assert4 && assert5);
+
+    const int block_size = Br * Bc;
+    const int tile_size = Tile_r * Tile_c;
+
+    dim3 grid(N / Br, N / Bc);
+    dim3 block(block_size / tile_size);
+    const size_t shmem_size = (
+        Br * Bc * mul + // shared_Q
+        Br * (Bc+1) +   // shared_K, shared_V
+        Br * Bc +       // shared_P
+        6*Br            // maxs, sums, es, el, li, mi
+    ) * sizeof(float);
+
+    // printf("N %d, d %d, BN %d, Bd %d, TN %d, mul %d, shmem %d\n", N, d, BN, Bd, TN, mul, shmem_size);
+
+    gpuAssert(cudaFuncSetAttribute(s2mm_kernel<Br, Bc, Tile_r, Tile_c, mul>, cudaFuncAttributeMaxDynamicSharedMemorySize, shmem_size));
+
+    s2mm_kernel<Br, Bc, Tile_r, Tile_c, mul><<<grid, block, shmem_size>>>(N, d, Q_d, K_d, V_d, O_d, m_d);
+    gpuAssert(cudaPeekAtLastError());
+}
+
+__host__ int
+s2mm(float* m_d, float* l_d, float *O_d, float *Q_d, float *K_d, float *V_d, int N, int d)
+{
+
+    const int M = 164 * 1024;
+
+    if(d == 128) {
+        const int Br = std::min((M + (4 * d) - 1) / d, d);
+        const int Bc = (M + (4 * d) - 1) / d;
+        const int Tile_r = 2;
+        const int Tile_c = 2;
+
+        setParamsAndCallKer<Br, Bc, Tile_r, Tile_c,2>(N,d,Q_d,K_d,V_d,O_d,m_d);
+    } else if (d == 64) {
+        const int Br = std::min((M + (4 * d) - 1) / d, d);
+        const int Bc = (M + (4 * d) - 1) / d;
+        const int Tile_r = 2;
+        const int Tile_c = 2;
+
+        setParamsAndCallKer<Br, Bc, Tile_r, Tile_c,1>(N,d,Q_d,K_d,V_d,O_d,m_d);
+    } else {
+        printf("Unsupported dataset, exiting!");
+        exit(1);
+    }
+    // cudaDeviceSynchronize();
+
+#if 0
+    {
+        float* m_h = (float*) malloc(N*sizeof(float));
+        cudaMemcpy(m_h, m_d, N*sizeof(float), cudaMemcpyDeviceToHost);
+        {
+            printf("(N,d,BN,TN)=(%d,%d,%d,%d), ms:\n    ", N,d,BN,TN);
+            for(int q=0; q<BN; q++) {
+                printf(", %f", m_h[q]);
+            }
+            printf("\n");
+        }
+
+        free(m_h);
+    }
+#endif
+
+    return 0;
 }
 
 int main(int argc, char **argv)
@@ -103,8 +277,7 @@ int main(int argc, char **argv)
         fprintf(stderr, "Warming up...");
 
         
-
-        TODO(m_d, l_d, O_d, Q_d, K_d, V_d, N, d);
+        s2mm(m_d, l_d, O_d, Q_d, K_d, V_d, N, d);
 
         
         gpuAssert(cudaDeviceSynchronize());
@@ -116,7 +289,7 @@ int main(int argc, char **argv)
 
         for(int i=0; i<runs; i++) {
             gettimeofday(&ts, NULL);
-            TODO(m_d, l_d, O_d, Q_d, K_d, V_d, N, d);
+            s2mm(m_d, l_d, O_d, Q_d, K_d, V_d, N, d);
             gpuAssert(cudaDeviceSynchronize());
             gettimeofday(&te, NULL);
             dur = (double)(te.tv_usec - ts.tv_usec) / 1e6 +
