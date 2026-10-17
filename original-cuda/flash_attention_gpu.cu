@@ -7,31 +7,16 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdbool.h>
+#include <stdint.h>
 #include <string.h>
 #include <math.h>
 #include <errno.h>
 #include <limits.h>
 #include <sys/time.h>
 #include <cuda_runtime.h>
+#include "../utils/utils.cuh"
 
 #define GPU_RUNS 50
-
-__host__ void gpuAssert(cudaError_t code) {
-  if(code != cudaSuccess) {
-    fprintf(stderr, "GPU Error: %s\n", cudaGetErrorString(code));
-    exit(EXIT_FAILURE);
-  }
-}
-
-static bool parse_positive_int(const char *text, int *value) {
-    char *end;
-    errno = 0;
-    long parsed = strtol(text, &end, 10);
-    if (errno != 0 || end == text || *end != '\0' || parsed <= 0 || parsed > INT_MAX)
-        return false;
-    *value = (int)parsed;
-    return true;
-}
 
 
 __device__ __forceinline__ float atomicMaxFloat (float * addr, float value) {
@@ -392,16 +377,19 @@ int main(int argc, char **argv)
     float *Q, *K, *V, *O, dur;
     int N, d, runs = GPU_RUNS;
     int status = EXIT_SUCCESS;
+    const char *in_path = argc == 6 ? argv[4] : NULL;
+    const char *out_path = argc == 6 ? argv[5] : NULL;
 
-    if (argc != 3 && argc != 4) {
+    if (argc != 3 && argc != 4 && argc != 6) {
         fprintf(stderr, "Usage:\n");
         fprintf(stderr, "  %s d N [runs] Compute with matrices filled with ones\n", argv[0]);
+        fprintf(stderr, "  %s d N runs in out Read Q, K, V from Futhark binary in, write O to out\n", argv[0]);
         return EXIT_FAILURE;
     }
 
     if (!parse_positive_int(argv[1], &d) ||
         !parse_positive_int(argv[2], &N) ||
-        (argc == 4 && !parse_positive_int(argv[3], &runs))) {
+        (argc >= 4 && !parse_positive_int(argv[3], &runs))) {
         fprintf(stderr, "d, N, and runs must be positive integers no greater than %d.\n", INT_MAX);
         return EXIT_FAILURE;
     }
@@ -434,8 +422,15 @@ int main(int argc, char **argv)
     if ((O = (float*)calloc(cnt, sizeof(float))) == NULL)
         goto mem_failure;
 
-    for (size_t i = 0; i < cnt; i++) {
-        Q[i] = K[i] = V[i] = 1;
+    if (in_path != NULL) {
+        if (!read_inputs(in_path, Q, K, V, cnt)) {
+            fprintf(stderr, "Failed to read %zu floats per matrix from %s.\n", cnt, in_path);
+            return EXIT_FAILURE;
+        }
+    } else {
+        for (size_t i = 0; i < cnt; i++) {
+            Q[i] = K[i] = V[i] = 1;
+        }
     }
 
     fprintf(stderr, "done.\n");
@@ -485,12 +480,19 @@ int main(int argc, char **argv)
         gpuAssert(cudaMemcpy(O, O_d, cnt*sizeof(float), cudaMemcpyDeviceToHost));
         gpuAssert(cudaDeviceSynchronize());
 
-        fprintf(stderr, "L2 norm is %lf (should be %lf)\n", L2(O, cnt), sqrt(cnt));
-        for (size_t i = 0; i < cnt; i++) {
-            if (!isfinite(O[i]) || fabsf(O[i] - 1.0f) > 1e-3f) {
-                fprintf(stderr, "Output check failed at element %zu: expected 1, got %g.\n", i, O[i]);
+        if (out_path != NULL) {
+            if (!write_output(out_path, O, N, d)) {
+                fprintf(stderr, "Failed to write output to %s.\n", out_path);
                 status = EXIT_FAILURE;
-                break;
+            }
+        } else {
+            fprintf(stderr, "L2 norm is %lf (should be %lf)\n", L2(O, cnt), sqrt(cnt));
+            for (size_t i = 0; i < cnt; i++) {
+                if (!isfinite(O[i]) || fabsf(O[i] - 1.0f) > 1e-3f) {
+                    fprintf(stderr, "Output check failed at element %zu: expected 1, got %g.\n", i, O[i]);
+                    status = EXIT_FAILURE;
+                    break;
+                }
             }
         }
 

@@ -1,6 +1,6 @@
 .DEFAULT_GOAL := compile
 
-FUTHARK ?= futhark
+FUTHARK := futhark
 BACKEND ?= cuda
 CFLAGS ?= -O3
 DEVICE ?= 0
