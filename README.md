@@ -3,6 +3,17 @@
 Programming Massively Parallel Hardware course project. The goal is to develop
 and optimize our own CUDA FlashAttention implementation and compare it against some baselines like the cuda and futhark ones here.
 
+## TODO
+
+1. Tiling and thread/warp mapping
+2. Tensor Core utilization
+3. Coalesced + vectorized memory access
+4. Shared-memory layout and bank conflicts
+5. Warp-level reductions and communication
+6. Synchronization and load/compute pipelining (cp.async)
+7. Register pressure, occupancy, and SM utilization
+8. Profiling + iterative parameter tuning
+
 ## Quick start on the GPU machine
 
 ```sh
