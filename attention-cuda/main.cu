@@ -44,7 +44,7 @@ __global__ void __launch_bounds__(Br * Bc) s2mm_kernel(int N, int d, const float
     extern __shared__ float smem[];
     float* Qi = smem;
     float* Kj = Qi + Br * d;
-    float* Vj = Kj + Bc * d;
+    float* Vj = Kj + Bc * (d + 1);
     float* Sij = Vj + Bc * d;
     float* Oi = Sij + Br * Bc;
     float* li = Oi + Br * d;
@@ -63,7 +63,7 @@ __global__ void __launch_bounds__(Br * Bc) s2mm_kernel(int N, int d, const float
                 int col = idx % d;
 
                 if (j * Bc + row < N) {
-                    Kj[row * d + col] = K[qkv_off + (j * Bc + row) * d + col];
+                    Kj[row * (d + 1) + col] = K[qkv_off + (j * Bc + row) * d + col];
                     Vj[row * d + col] = V[qkv_off + (j * Bc + row) * d + col];
                 }
             }
@@ -94,7 +94,7 @@ __global__ void __launch_bounds__(Br * Bc) s2mm_kernel(int N, int d, const float
 
             float acc = 0.f;
             for (int k = 0; k < d; k++)
-                acc += Qi[s_row * d + k] * Kj[s_col * d + k];
+                acc += Qi[s_row * d + k] * Kj[s_col * (d + 1) + k];
 
             Sij[s_row * Bc + s_col] = acc;
             __syncthreads();
@@ -162,7 +162,8 @@ void setParamsAndCallKer(int N, int d, float *Q_d, float *K_d, float *V_d, float
     dim3 block(Br * Bc);
     const size_t shmem_size = (
         Br * d +        // Qi
-        2 * Bc * d +    // Kj, Vj
+        Bc * (d + 1) +  // Kj (padded)
+        Bc * d +        // Vj
         Br * Bc +       // Sij
         Br * d +        // Oi
         5 * Br          // li, li_new, mi, mi_new, mij_dash
