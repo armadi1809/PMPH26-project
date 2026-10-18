@@ -71,9 +71,6 @@ __global__ void __launch_bounds__((Br / TN) * (Bc / TN), 2) s2mm_kernel(int N, c
         }
     }
 
-    // set O, m, l
-    const int num_threads = blockDim.x;
-
     __syncthreads();
 
     const int tr = tx / (Bc / TN);
@@ -360,16 +357,24 @@ int main(int argc, char **argv)
 
         fprintf(stderr, "Printing runtimes to stdout\n");
 
-        for(int i=0; i<runs; i++) {
-            gettimeofday(&ts, NULL);
+        cudaEvent_t start, stop;
+        gpuAssert(cudaEventCreate(&start));
+        gpuAssert(cudaEventCreate(&stop));
+
+        for (int i = 0; i < runs; i++) {
+            gpuAssert(cudaEventRecord(start));
             s2mm(m_d, l_d, O_d, Q_d, K_d, V_d, N, d);
-            gpuAssert(cudaDeviceSynchronize());
-            gettimeofday(&te, NULL);
-            dur = (double)(te.tv_usec - ts.tv_usec) / 1e6 +
-                  (double)(te.tv_sec - ts.tv_sec);
+            gpuAssert(cudaEventRecord(stop));
+            gpuAssert(cudaEventSynchronize(stop));
+
+            float ms;
+            gpuAssert(cudaEventElapsedTime(&ms, start, stop));
+            dur = ms / 1e3;                 // seconds, as before
             printf("%f\n", dur);
         }
 
+        gpuAssert(cudaEventDestroy(start));
+        gpuAssert(cudaEventDestroy(stop));
 
         gpuAssert(cudaMemcpy(O, O_d, cnt*sizeof(float), cudaMemcpyDeviceToHost));
         gpuAssert(cudaDeviceSynchronize());
