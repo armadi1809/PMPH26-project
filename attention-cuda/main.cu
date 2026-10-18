@@ -36,7 +36,7 @@ float* allocate_host_memory(size_t cnt) {
 
 
 template <int Br, int Bc, int TN, int d>
-__global__ void __launch_bounds__((Br / TN) * (Bc / TN)) s2mm_kernel(int N, const float* Q, const float* K, const float* V, float* O, float *m, float*l) {
+__global__ void __launch_bounds__((Br / TN) * (Bc / TN), 2) s2mm_kernel(int N, const float* Q, const float* K, const float* V, float* O, float *m, float*l) {
     
     constexpr int NT = (Br / TN) * (Bc / TN);
     constexpr int S_STRIDE = Bc + 1;
