@@ -45,9 +45,8 @@ __global__ void __launch_bounds__((Br / TN) * (Bc / TN)) s2mm_kernel(int N, cons
     float* Kj = Qi + Br * d;
     float* Vj = Kj + Bc * (d + 1);
     float* Sij = Vj + Bc * d;
-    float* Oi = Sij + Br * S_STRIDE;
 
-    float* li = Oi + Br * d;
+    float* li = Sij + Br * S_STRIDE;
     float* li_new = li + Br;
 
     float* mi = li_new + Br;
@@ -73,9 +72,6 @@ __global__ void __launch_bounds__((Br / TN) * (Bc / TN)) s2mm_kernel(int N, cons
     // set O, m, l
     const int num_threads = blockDim.x;
 
-    for (int t = threadIdx.x; t < Br * d; t += num_threads)
-        Oi[t] = 0.f;
-
     for (int t = threadIdx.x; t < Br; t += num_threads) {
         mi[t] = -INFINITY;
         li[t] = 0.f;
@@ -85,6 +81,12 @@ __global__ void __launch_bounds__((Br / TN) * (Bc / TN)) s2mm_kernel(int N, cons
 
     const int tr = tx / (Bc / TN);
     const int tc = tx % (Bc / TN);
+
+    constexpr int TC  = Bc / TN;          // thread-columns: 16
+    constexpr int DCH = d / (TC * TN);    // column chunks per thread: 1 (d=64) or 2 (d=128)
+    static_assert(d % (TC * TN) == 0, "d must be a multiple of TC * TN");
+
+    float o[DCH][TN][TN] = {0.f};         // replaces Oi in shared memory
 
     for (int j = 0; j < Tc; j++) {
         __syncthreads();
@@ -143,21 +145,54 @@ __global__ void __launch_bounds__((Br / TN) * (Bc / TN)) s2mm_kernel(int N, cons
                             expf(row_m - mi_new[row]) * row_l;
         }
         __syncthreads();
+        // P V: outer products over the keys c, same pattern as Q K^T
+        float pv[DCH][TN][TN] = {0.f};
+        for (int c = 0; c < Bc; c++) {
+            float p[TN];
+            #pragma unroll
+            for (int r = 0; r < TN; r++) p[r] = Sij[(tr * TN + r) * S_STRIDE + c];
+            #pragma unroll
+            for (int q = 0; q < DCH; q++) {
+                float v[TN];
+                #pragma unroll
+                for (int cc = 0; cc < TN; cc++) v[cc] = Vj[c * d + q * TC * TN + tc * TN + cc];
+                #pragma unroll
+                for (int r = 0; r < TN; r++)
+                    #pragma unroll
+                    for (int cc = 0; cc < TN; cc++)
+                        pv[q][r][cc] += p[r] * v[cc];
+            }
+        }
 
-        // P V and O update: block-stride over all Br * d output elements
-        for (int t = tx; t < Br * d; t += NT) {
-            int row = t / d;
-            int col = t % d;
-
-            float acc = 0.f;
-            for (int c = 0; c < Bc; c++)
-                acc += Sij[row * S_STRIDE + c] * Vj[c * d + col];
-
-            Oi[t] = (1.f / li_new[row]) *
-                    (li[row] * expf(mi[row] - mi_new[row]) * Oi[t] +
-                     expf(mij_dash[row] - mi_new[row]) * acc);
+        // O update (paper's Step 12), per-row factors computed once per row
+        #pragma unroll
+        for (int r = 0; r < TN; r++) {
+            int row = tr * TN + r;
+            float inv_l = 1.f / li_new[row];
+            float a = li[row] * expf(mi[row] - mi_new[row]) * inv_l;
+            float b = expf(mij_dash[row] - mi_new[row]) * inv_l;
+            #pragma unroll
+            for (int q = 0; q < DCH; q++)
+                #pragma unroll
+                for (int cc = 0; cc < TN; cc++)
+                    o[q][r][cc] = a * o[q][r][cc] + b * pv[q][r][cc];
         }
         __syncthreads();
+
+        // P V and O update: block-stride over all Br * d output elements
+        // for (int t = tx; t < Br * d; t += NT) {
+        //     int row = t / d;
+        //     int col = t % d;
+
+        //     float acc = 0.f;
+        //     for (int c = 0; c < Bc; c++)
+        //         acc += Sij[row * S_STRIDE + c] * Vj[c * d + col];
+
+        //     Oi[t] = (1.f / li_new[row]) *
+        //             (li[row] * expf(mi[row] - mi_new[row]) * Oi[t] +
+        //              expf(mij_dash[row] - mi_new[row]) * acc);
+        // }
+        // __syncthreads();
 
         for (int row = tx; row < Br; row += NT) {
             mi[row] = mi_new[row];
@@ -165,10 +200,21 @@ __global__ void __launch_bounds__((Br / TN) * (Bc / TN)) s2mm_kernel(int N, cons
         }
     }
 
-    for (int t = tx; t < Br * d; t += num_threads) {
-        int row = t / d;
-        if (i * Br + row < N)
-            O[qkv_off + (i * Br) * d + t] = Oi[t];
+    // for (int t = tx; t < Br * d; t += num_threads) {
+    //     int row = t / d;
+    //     if (i * Br + row < N)
+    //         O[qkv_off + (i * Br) * d + t] = Oi[t];
+
+    // }
+    #pragma unroll
+    for (int r = 0; r < TN; r++) {
+        int grow = i * Br + tr * TN + r;
+        if (grow < N)
+            #pragma unroll
+            for (int q = 0; q < DCH; q++)
+                #pragma unroll
+                for (int cc = 0; cc < TN; cc++)
+                    O[qkv_off + grow * d + q * TC * TN + tc * TN + cc] = o[q][r][cc];
     }
 }
 
@@ -192,7 +238,7 @@ void setParamsAndCallKer(int N, float *Q_d, float *K_d, float *V_d, float *O_d, 
         Bc * (d + 1) +      // Kj   (padded rows)
         Bc * d +            // Vj
         Br * (Bc + 1) +     // Sij  (padded rows)
-        Br * d +            // Oi
+        // Br * d +            // Oi
         5 * Br              // li, li_new, mi, mi_new, mij_dash
     ) * sizeof(float);
     // printf("N %d, d %d, BN %d, Bd %d, TN %d, mul %d, shmem %d\n", N, d, BN, Bd, TN, mul, shmem_size);
@@ -209,8 +255,6 @@ s2mm(float* m_d, float* l_d, float *O_d, float *Q_d, float *K_d, float *V_d, int
 
     const int M = 164 * 1024;    
     const int Br = std::min(CEIL_DIV(M, 4 * d), d);
-    const int Bc = CEIL_DIV(M, 4 *d);
-    // Tr blocks!
 
 
     if(d == 128) {
