@@ -105,7 +105,6 @@ __global__ void __launch_bounds__((Br / TN) * (Bc / TN), 2) s2mm_kernel(int N, c
         __syncthreads();
 
         float s[TN][TN] = {0.f};
-        #pragma unroll
         for (int k = 0; k < d; k++) {
             float q[TN], kv[TN];
             #pragma unroll
@@ -179,7 +178,6 @@ __global__ void __launch_bounds__((Br / TN) * (Bc / TN), 2) s2mm_kernel(int N, c
                     o[q][r][cc] *= a[r];
 
         // P V: accumulate straight into the (already rescaled) o
-        #pragma unroll
         for (int c = 0; c < Bc; c++) {
             float p[TN];
             #pragma unroll
