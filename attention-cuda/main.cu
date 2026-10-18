@@ -114,7 +114,6 @@ __global__ void __launch_bounds__((Br / TN) * (Bc / TN)) s2mm_kernel(int N, cons
         }
 
         float a[TN];
-        float b[TN];
         #pragma unroll
         for (int r = 0; r < TN; r++) {
             // mask out-of-range keys
@@ -143,19 +142,26 @@ __global__ void __launch_bounds__((Br / TN) * (Bc / TN)) s2mm_kernel(int N, cons
             float l_new = expf(m_reg[r] - m_new) * l_reg[r] + expf(mx - m_new) * sum;
             float inv_l = 1.f / l_new;
             a[r] = l_reg[r] * expf(m_reg[r] - m_new) * inv_l;
-            b[r] = expf(mx - m_new) * inv_l;
+            float b = expf(mx - m_new) * inv_l;
             m_reg[r] = m_new;
             l_reg[r] = l_new;
 
             // publish P for the P V product
             #pragma unroll
             for (int c = 0; c < TN; c++)
-                Sij[(tr * TN + r) * S_STRIDE + tc * TN + c] = s[r][c];
+                Sij[(tr * TN + r) * S_STRIDE + tc * TN + c] = s[r][c] * b;
         }
         __syncwarp();
 
-        // P V: outer products over the keys c, same pattern as Q K^T
-        float pv[DCH][TN][TN] = {0.f};
+        #pragma unroll
+        for (int r = 0; r < TN; r++)
+            #pragma unroll
+            for (int q = 0; q < DCH; q++)
+                #pragma unroll
+                for (int cc = 0; cc < TN; cc++)
+                    o[q][r][cc] *= a[r];
+
+        // P V: accumulate straight into the (already rescaled) o
         for (int c = 0; c < Bc; c++) {
             float p[TN];
             #pragma unroll
@@ -169,21 +175,9 @@ __global__ void __launch_bounds__((Br / TN) * (Bc / TN)) s2mm_kernel(int N, cons
                 for (int r = 0; r < TN; r++)
                     #pragma unroll
                     for (int cc = 0; cc < TN; cc++)
-                        pv[q][r][cc] += p[r] * v[cc];
+                        o[q][r][cc] += p[r] * v[cc];
             }
         }
-
-        // O update (paper's Step 12), per-row factors computed once per row
-        #pragma unroll
-        for (int r = 0; r < TN; r++) {
-            #pragma unroll
-            for (int q = 0; q < DCH; q++)
-                #pragma unroll
-                for (int cc = 0; cc < TN; cc++)
-                    o[q][r][cc] = a[r] * o[q][r][cc] + b[r] * pv[q][r][cc];
-        }
-        __syncthreads();
-
     }
 
     #pragma unroll
