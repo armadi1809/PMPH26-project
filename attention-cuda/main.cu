@@ -40,7 +40,7 @@ __global__ void __launch_bounds__((Br / TN) * (Bc / TN)) s2mm_kernel(int N, cons
     
     constexpr int NT = (Br / TN) * (Bc / TN);
     constexpr int S_STRIDE = Bc + 1;
-    const int loads_KV = CEIL_DIV(Bc * d, NT);
+    constexpr int loads_KV = CEIL_DIV(Bc * d, NT);
 
     int tx = threadIdx.x;
 
@@ -57,8 +57,9 @@ __global__ void __launch_bounds__((Br / TN) * (Bc / TN)) s2mm_kernel(int N, cons
     int i = blockIdx.x;
 
     // load Q_i
-    const int elem_loads_per_thread_Q = CEIL_DIV(Br * d, NT);
+    constexpr int elem_loads_per_thread_Q = CEIL_DIV(Br * d, NT);
 
+    #pragma unroll
     for (int e = 0; e < elem_loads_per_thread_Q; e++) {
         int idx = e * (NT) + tx;
         if (idx < Br * d) {
@@ -94,6 +95,7 @@ __global__ void __launch_bounds__((Br / TN) * (Bc / TN)) s2mm_kernel(int N, cons
     for (int j = 0; j < Tc; j++) {
         __syncthreads();
         
+        #pragma unroll
         for (int e = 0; e < loads_KV; e++) {
             int idx = e * NT + tx;
             if (idx < Bc * d) {
@@ -106,6 +108,7 @@ __global__ void __launch_bounds__((Br / TN) * (Bc / TN)) s2mm_kernel(int N, cons
         __syncthreads();
 
         float s[TN][TN] = {0.f};
+        #pragma unroll
         for (int k = 0; k < d; k++) {
             float q[TN], kv[TN];
             #pragma unroll
@@ -159,7 +162,7 @@ __global__ void __launch_bounds__((Br / TN) * (Bc / TN)) s2mm_kernel(int N, cons
         }
         // __syncwarp();
         __syncthreads();
-
+        #pragma unroll
         for (int e = 0; e < loads_KV; e++) {               // (7) V into the same buffer
             int idx = e * NT + tx;
             if (idx < Bc * d) {
@@ -179,6 +182,7 @@ __global__ void __launch_bounds__((Br / TN) * (Bc / TN)) s2mm_kernel(int N, cons
                     o[q][r][cc] *= a[r];
 
         // P V: accumulate straight into the (already rescaled) o
+        #pragma unroll
         for (int c = 0; c < Bc; c++) {
             float p[TN];
             #pragma unroll
