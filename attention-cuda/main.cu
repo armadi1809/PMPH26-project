@@ -71,9 +71,6 @@ __global__ void __launch_bounds__((Br / TN) * (Bc / TN), 2) s2mm_kernel(int N, c
         }
     }
 
-    // set O, m, l
-    const int num_threads = blockDim.x;
-
     __syncthreads();
 
     const int tr = tx / (Bc / TN);
