@@ -17,6 +17,14 @@
 #define GPU_RUNS 50
 #define CEIL_DIV(x, y) ((x) >= 0 ? (((x) + (y) - 1) / (y)) : ((x) / (y)))
 
+template <int Br, int Bc, int D>
+struct SmemLayout {
+    static constexpr int Q     = Br * D;
+    static constexpr int KV    = Bc * (D + 1);     // K tile (padded); V tile reuses it
+    static constexpr int S     = Br * (Bc + 1);
+    static constexpr int TOTAL = Q + KV + S;
+};
+
 float* allocate_host_memory(size_t cnt) {
     float * ptr;
     if ((ptr = (float*) calloc(cnt, sizeof(float))) == NULL) {
@@ -41,10 +49,10 @@ __global__ void __launch_bounds__((Br / TN) * (Bc / TN)) s2mm_kernel(int N, cons
     int qkv_off = 0;
 
     extern __shared__ float smem[];
-    float* Qi = smem;
-    float* Kj = Qi + Br * d;
-    float* Vj = Kj + Bc * (d + 1);
-    float* Sij = Vj + Bc * d;
+    using L = SmemLayout<Br, Bc, d>;
+    float* Qi  = smem;
+    float* KVj = Qi  + L::Q;
+    float* Sij = KVj + L::KV;
 
     int i = blockIdx.x;
 
@@ -87,16 +95,14 @@ __global__ void __launch_bounds__((Br / TN) * (Bc / TN)) s2mm_kernel(int N, cons
         __syncthreads();
         
         for (int e = 0; e < loads_KV; e++) {
-                int idx = e * NT + tx;                  // stride by NT, not Br * Bc
-                if (idx < Bc * d) {
-                    int row = idx / d;
-                    int col = idx % d;
-                    if (j * Bc + row < N) {
-                        Kj[row * (d + 1) + col] = K[qkv_off + (j * Bc + row) * d + col];
-                        Vj[row * d + col]       = V[qkv_off + (j * Bc + row) * d + col];
-                    }
-                }
+            int idx = e * NT + tx;
+            if (idx < Bc * d) {
+                int row = idx / d, col = idx % d;
+                if (j * Bc + row < N)
+                    KVj[row * (d + 1) + col] = K[qkv_off + (j * Bc + row) * d + col];
             }
+        }
+
         __syncthreads();
 
         float s[TN][TN] = {0.f};
@@ -105,7 +111,7 @@ __global__ void __launch_bounds__((Br / TN) * (Bc / TN)) s2mm_kernel(int N, cons
             #pragma unroll
             for (int r = 0; r < TN; r++) q[r]  = Qi[(tr * TN + r) * d + k];
             #pragma unroll
-            for (int c = 0; c < TN; c++) kv[c] = Kj[(tc * TN + c) * (d + 1) + k];
+            for (int c = 0; c < TN; c++) kv[c] = KVj[(tc * TN + c) * (d + 1) + k];
             #pragma unroll
             for (int r = 0; r < TN; r++)
                 #pragma unroll
@@ -151,7 +157,18 @@ __global__ void __launch_bounds__((Br / TN) * (Bc / TN)) s2mm_kernel(int N, cons
             for (int c = 0; c < TN; c++)
                 Sij[(tr * TN + r) * S_STRIDE + tc * TN + c] = s[r][c] * b;
         }
-        __syncwarp();
+        // __syncwarp();
+        __syncthreads();
+
+        for (int e = 0; e < loads_KV; e++) {               // (7) V into the same buffer
+            int idx = e * NT + tx;
+            if (idx < Bc * d) {
+                int row = idx / d, col = idx % d;
+                if (j * Bc + row < N)
+                    KVj[row * d + col] = V[qkv_off + (j * Bc + row) * d + col];
+            }
+        }
+        __syncthreads();                                   // (8)
 
         #pragma unroll
         for (int r = 0; r < TN; r++)
@@ -170,7 +187,7 @@ __global__ void __launch_bounds__((Br / TN) * (Bc / TN)) s2mm_kernel(int N, cons
             for (int q = 0; q < DCH; q++) {
                 float v[TN];
                 #pragma unroll
-                for (int cc = 0; cc < TN; cc++) v[cc] = Vj[c * d + q * TC * TN + tc * TN + cc];
+                for (int cc = 0; cc < TN; cc++) v[cc] = KVj[c * d + q * TC * TN + tc * TN + cc];
                 #pragma unroll
                 for (int r = 0; r < TN; r++)
                     #pragma unroll
@@ -194,30 +211,19 @@ __global__ void __launch_bounds__((Br / TN) * (Bc / TN)) s2mm_kernel(int N, cons
 
 template <int Br, int Bc, int TN, int d>
 void setParamsAndCallKer(int N, float *Q_d, float *K_d, float *V_d, float *O_d, float* m_d, float*l_d) {
-    // Assumptions: ( TN | BN ) && ( BN | d ) && ( TN^2 | BN ) && 
-    //              ( (BN / TN^2) | BN ) && ( BN >= TN^2 ) && (BN | N)
-    // TODO: come to this back later and fix it
-    // bool assert1 = (BN % TN) == 0;
-    // bool assert2 = (d % BN)  == 0;
-    // bool assert3 = (BN % (TN*TN)) == 0;
-    // bool assert4 = (BN % (BN / (TN*TN)))  == 0;
-    // bool assert5 = (BN >= (TN*TN));
-    // assert(assert1 && assert2 && assert3 && assert4 && assert5);
     constexpr int NT = (Br / TN) * (Bc / TN);
     dim3 block(NT);
-    dim3 grid(CEIL_DIV(N, Br));     // CEIL_DIV, consistent with the kernel's bounds checks
+    dim3 grid(CEIL_DIV(N, Br));
 
-    const size_t shmem_size = (
-        Br * d +            // Qi
-        Bc * (d + 1) +      // Kj   (padded rows)
-        Bc * d +            // Vj
-        Br * (Bc + 1)     // Sij  (padded rows)
-        // Br * d +            // Oi
-        // 5 * Br              // li, li_new, mi, mi_new, mij_dash
-    ) * sizeof(float);
-    // printf("N %d, d %d, BN %d, Bd %d, TN %d, mul %d, shmem %d\n", N, d, BN, Bd, TN, mul, shmem_size);
+    const size_t shmem_size = SmemLayout<Br, Bc, d>::TOTAL * sizeof(float);
 
     gpuAssert(cudaFuncSetAttribute(s2mm_kernel<Br, Bc, TN, d>, cudaFuncAttributeMaxDynamicSharedMemorySize, shmem_size));
+    gpuAssert(cudaFuncSetAttribute(s2mm_kernel<Br, Bc, TN, d>, cudaFuncAttributePreferredSharedMemoryCarveout, cudaSharedmemCarveoutMaxShared));
+
+    int blocks_per_sm;
+    gpuAssert(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+        &blocks_per_sm, s2mm_kernel<Br, Bc, TN, d>, NT, shmem_size));
+    fprintf(stderr, "d = %d: %d blocks per SM\n", d, blocks_per_sm);
 
     s2mm_kernel<Br, Bc, TN, d><<<grid, block, shmem_size>>>(N, Q_d, K_d, V_d, O_d, m_d, l_d);
     gpuAssert(cudaPeekAtLastError());
