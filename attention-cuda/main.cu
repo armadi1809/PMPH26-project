@@ -46,13 +46,6 @@ __global__ void __launch_bounds__((Br / TN) * (Bc / TN)) s2mm_kernel(int N, cons
     float* Vj = Kj + Bc * (d + 1);
     float* Sij = Vj + Bc * d;
 
-    float* li = Sij + Br * S_STRIDE;
-    float* li_new = li + Br;
-
-    float* mi = li_new + Br;
-    float* mi_new = mi + Br;
-    float* mij_dash = mi_new + Br;
-
     int i = blockIdx.x;
 
     // load Q_i
@@ -72,11 +65,6 @@ __global__ void __launch_bounds__((Br / TN) * (Bc / TN)) s2mm_kernel(int N, cons
     // set O, m, l
     const int num_threads = blockDim.x;
 
-    for (int t = threadIdx.x; t < Br; t += num_threads) {
-        mi[t] = -INFINITY;
-        li[t] = 0.f;
-    }
-
     __syncthreads();
 
     const int tr = tx / (Bc / TN);
@@ -87,6 +75,13 @@ __global__ void __launch_bounds__((Br / TN) * (Bc / TN)) s2mm_kernel(int N, cons
     static_assert(d % (TC * TN) == 0, "d must be a multiple of TC * TN");
 
     float o[DCH][TN][TN] = {0.f};         // replaces Oi in shared memory
+    
+    static_assert(TC <= 32 && (TC & (TC - 1)) == 0, "row group must fit in a warp, power of 2");
+
+    float m_reg[TN], l_reg[TN];
+    #pragma unroll
+    for (int r = 0; r < TN; r++) { m_reg[r] = -INFINITY; l_reg[r] = 0.f; }
+
 
     for (int j = 0; j < Tc; j++) {
         __syncthreads();
@@ -118,33 +113,47 @@ __global__ void __launch_bounds__((Br / TN) * (Bc / TN)) s2mm_kernel(int N, cons
                     s[r][c] += q[r] * kv[c];
         }
 
+        float a[TN];
+        float b[TN];
         #pragma unroll
-        for (int r = 0; r < TN; r++)
+        for (int r = 0; r < TN; r++) {
+            // mask out-of-range keys
             #pragma unroll
-            for (int c = 0; c < TN; c++) {
-                int key = j * Bc + tc * TN + c;              // global key index
-                Sij[(tr * TN + r) * S_STRIDE + tc * TN + c] = (key < N) ? s[r][c] : -INFINITY;
-            }
-        
-        __syncthreads();
-        // softmax: one thread per row (only tx < Br do work, since Br = 64 < NT = 256)
-        for (int row = tx; row < Br; row += NT) {
-            float row_m = -INFINITY, row_l = 0.f;
-            for (int c = 0; c < Bc; c++)
-                row_m = fmaxf(row_m, Sij[row * S_STRIDE + c]);
+            for (int c = 0; c < TN; c++)
+                if (j * Bc + tc * TN + c >= N) s[r][c] = -INFINITY;
 
-            for (int c = 0; c < Bc; c++) {
-                float exp_val = expf(Sij[row * S_STRIDE + c] - row_m);
-                Sij[row * S_STRIDE + c] = exp_val;
-                row_l += exp_val;
-            }
+            // row max: own 4 values, then butterfly across the 16 lanes
+            float mx = s[r][0];
+            #pragma unroll
+            for (int c = 1; c < TN; c++) mx = fmaxf(mx, s[r][c]);
+            #pragma unroll
+            for (int off = TC / 2; off > 0; off >>= 1)
+                mx = fmaxf(mx, __shfl_xor_sync(0xffffffff, mx, off));
 
-            mij_dash[row] = row_m;
-            mi_new[row]   = fmaxf(mi[row], row_m);
-            li_new[row]   = expf(mi[row] - mi_new[row]) * li[row] +
-                            expf(row_m - mi_new[row]) * row_l;
+            // exponentials and row sum, same pattern
+            float sum = 0.f;
+            #pragma unroll
+            for (int c = 0; c < TN; c++) { s[r][c] = expf(s[r][c] - mx); sum += s[r][c]; }
+            #pragma unroll
+            for (int off = TC / 2; off > 0; off >>= 1)
+                sum += __shfl_xor_sync(0xffffffff, sum, off);
+
+            // paper's update, all in registers
+            float m_new = fmaxf(m_reg[r], mx);
+            float l_new = expf(m_reg[r] - m_new) * l_reg[r] + expf(mx - m_new) * sum;
+            float inv_l = 1.f / l_new;
+            a[r] = l_reg[r] * expf(m_reg[r] - m_new) * inv_l;
+            b[r] = expf(mx - m_new) * inv_l;
+            m_reg[r] = m_new;
+            l_reg[r] = l_new;
+
+            // publish P for the P V product
+            #pragma unroll
+            for (int c = 0; c < TN; c++)
+                Sij[(tr * TN + r) * S_STRIDE + tc * TN + c] = s[r][c];
         }
-        __syncthreads();
+        __syncwarp();
+
         // P V: outer products over the keys c, same pattern as Q K^T
         float pv[DCH][TN][TN] = {0.f};
         for (int c = 0; c < Bc; c++) {
@@ -167,45 +176,16 @@ __global__ void __launch_bounds__((Br / TN) * (Bc / TN)) s2mm_kernel(int N, cons
         // O update (paper's Step 12), per-row factors computed once per row
         #pragma unroll
         for (int r = 0; r < TN; r++) {
-            int row = tr * TN + r;
-            float inv_l = 1.f / li_new[row];
-            float a = li[row] * expf(mi[row] - mi_new[row]) * inv_l;
-            float b = expf(mij_dash[row] - mi_new[row]) * inv_l;
             #pragma unroll
             for (int q = 0; q < DCH; q++)
                 #pragma unroll
                 for (int cc = 0; cc < TN; cc++)
-                    o[q][r][cc] = a * o[q][r][cc] + b * pv[q][r][cc];
+                    o[q][r][cc] = a[r] * o[q][r][cc] + b[r] * pv[q][r][cc];
         }
         __syncthreads();
 
-        // P V and O update: block-stride over all Br * d output elements
-        // for (int t = tx; t < Br * d; t += NT) {
-        //     int row = t / d;
-        //     int col = t % d;
-
-        //     float acc = 0.f;
-        //     for (int c = 0; c < Bc; c++)
-        //         acc += Sij[row * S_STRIDE + c] * Vj[c * d + col];
-
-        //     Oi[t] = (1.f / li_new[row]) *
-        //             (li[row] * expf(mi[row] - mi_new[row]) * Oi[t] +
-        //              expf(mij_dash[row] - mi_new[row]) * acc);
-        // }
-        // __syncthreads();
-
-        for (int row = tx; row < Br; row += NT) {
-            mi[row] = mi_new[row];
-            li[row] = li_new[row];
-        }
     }
 
-    // for (int t = tx; t < Br * d; t += num_threads) {
-    //     int row = t / d;
-    //     if (i * Br + row < N)
-    //         O[qkv_off + (i * Br) * d + t] = Oi[t];
-
-    // }
     #pragma unroll
     for (int r = 0; r < TN; r++) {
         int grow = i * Br + tr * TN + r;
@@ -237,9 +217,9 @@ void setParamsAndCallKer(int N, float *Q_d, float *K_d, float *V_d, float *O_d, 
         Br * d +            // Qi
         Bc * (d + 1) +      // Kj   (padded rows)
         Bc * d +            // Vj
-        Br * (Bc + 1) +     // Sij  (padded rows)
+        Br * (Bc + 1)     // Sij  (padded rows)
         // Br * d +            // Oi
-        5 * Br              // li, li_new, mi, mi_new, mij_dash
+        // 5 * Br              // li, li_new, mi, mi_new, mij_dash
     ) * sizeof(float);
     // printf("N %d, d %d, BN %d, Bd %d, TN %d, mul %d, shmem %d\n", N, d, BN, Bd, TN, mul, shmem_size);
 
