@@ -12,6 +12,7 @@
 #include <limits.h>
 #include <sys/time.h>
 #include <cuda_runtime.h>
+#include <cuda_pipeline.h>
 #include "../utils/utils.cuh"
 
 #define GPU_RUNS 50
@@ -21,12 +22,20 @@
 // This lets the kernel drop every bounds check.
 constexpr int TILE = 64;
 
+// For d = 64, K and V get separate buffers, and the V tile is prefetched with
+// cp.async while Q K^T runs. For d = 128, K and V share one buffer (as before),
+// to keep 2 blocks per SM.
+template <int D>
+struct PrefetchV { static constexpr bool value = (D == 64); };
+
 template <int Br, int Bc, int D>
 struct SmemLayout {
-    static constexpr int Q     = Br * D;   // Q tile, transposed: D rows of Br (swizzled)
-    static constexpr int KV    = Bc * D;   // K tile, transposed: D rows of Bc (swizzled); then V: Bc rows of D
-    static constexpr int S     = Bc * Br;  // P tile, transposed: Bc rows of Br (swizzled)
-    static constexpr int TOTAL = Q + KV + S;
+    static constexpr bool SPLIT = PrefetchV<D>::value;
+    static constexpr int Q     = Br * D;              // Q tile, transposed: D rows of Br (swizzled)
+    static constexpr int K     = Bc * D;              // K tile, transposed: D rows of Bc (swizzled)
+    static constexpr int V     = SPLIT ? Bc * D : 0;  // V tile, row-major (own buffer only if SPLIT)
+    static constexpr int S     = Bc * Br;             // P tile, transposed: Bc rows of Br (swizzled)
+    static constexpr int TOTAL = Q + K + V + S;
 };
 
 // Index into a transposed tile with W floats per row: group (x / 4) of row k
@@ -55,7 +64,10 @@ s2mm_kernel(int N, const float* Q, const float* K, const float* V, float* O, flo
 
     constexpr int Q_LOADS  = Br * d / NT;        // scalar loads per thread for the Q tile
     constexpr int K_LOADS  = Bc * d / NT;        // scalar loads per thread for a K tile
-    constexpr int V_LOADS4 = Bc * d / 4 / NT;    // float4 loads per thread for a V tile
+    constexpr int V_LOADS4 = Bc * d / 4 / NT;    // 16-byte loads per thread for a V tile
+
+    using L = SmemLayout<Br, Bc, d>;
+    constexpr bool SPLIT = L::SPLIT;
 
     static_assert(TN == 4, "float4 accesses assume TN == 4");
     static_assert(Br == TILE && Bc == TILE, "tiles are fixed at 64");
@@ -66,10 +78,11 @@ s2mm_kernel(int N, const float* Q, const float* K, const float* V, float* O, flo
     static_assert(TC <= 32 && (TC & (TC - 1)) == 0, "row group must fit in a warp, power of 2");
 
     extern __shared__ __align__(16) float smem[];
-    using L = SmemLayout<Br, Bc, d>;
     float* Qi  = smem;
-    float* KVj = Qi  + L::Q;
-    float* Sij = KVj + L::KV;
+    float* Kj  = Qi + L::Q;
+    float* Vj  = SPLIT ? Kj + L::K : Kj;         // own buffer, or aliased with K
+    // float* Sij = Kj + L::K + L::V;
+    float* Sij = SPLIT ? Kj : Kj + L::K + L::V;
 
     const int tx = threadIdx.x;
     const int tr = tx / TC;
@@ -96,13 +109,23 @@ s2mm_kernel(int N, const float* Q, const float* K, const float* V, float* O, flo
         const float* Kb = K + (size_t)j * Bc * d;
         const float* Vb = V + (size_t)j * Bc * d;
 
-        __syncthreads();                         // previous P V is done with KVj and Sij
+        __syncthreads();                         // previous P V is done with Kj, Vj and Sij
 
         // K tile, stored transposed and swizzled
         #pragma unroll
         for (int e = 0; e < K_LOADS; e++) {
             const int idx = e * NT + tx;
-            KVj[swz<Bc>(idx % d, idx / d)] = Kb[idx];
+            Kj[swz<Bc>(idx % d, idx / d)] = Kb[idx];
+        }
+
+        // Start copying the V tile into its own buffer; it arrives while Q K^T runs
+        if constexpr (SPLIT) {
+            #pragma unroll
+            for (int e = 0; e < V_LOADS4; e++) {
+                const int f = e * NT + tx;
+                __pipeline_memcpy_async(&Vj[f * 4], &Vb[f * 4], 16);
+            }
+            __pipeline_commit();
         }
         __syncthreads();                         // K tile complete
 
@@ -114,7 +137,7 @@ s2mm_kernel(int N, const float* Q, const float* K, const float* V, float* O, flo
             for (int kk = 0; kk < KCH; kk++) {
                 const int k = k0 + kk;
                 const float4 q4 = *reinterpret_cast<const float4*>(&Qi[swz<Br>(k, tr * TN)]);
-                const float4 k4 = *reinterpret_cast<const float4*>(&KVj[swz<Bc>(k, tc * TN)]);
+                const float4 k4 = *reinterpret_cast<const float4*>(&Kj[swz<Bc>(k, tc * TN)]);
                 const float q[TN]  = {q4.x, q4.y, q4.z, q4.w};
                 const float kv[TN] = {k4.x, k4.y, k4.z, k4.w};
                 #pragma unroll
@@ -152,6 +175,7 @@ s2mm_kernel(int N, const float* Q, const float* K, const float* V, float* O, flo
             l_reg[r] = l_new;
         }
 
+        if constexpr (SPLIT) __syncthreads();
         // Publish b * P, transposed and swizzled: one float4 per key
         #pragma unroll
         for (int c = 0; c < TN; c++) {
@@ -159,15 +183,19 @@ s2mm_kernel(int N, const float* Q, const float* K, const float* V, float* O, flo
                                           s[2][c] * b[2], s[3][c] * b[3]);
             *reinterpret_cast<float4*>(&Sij[swz<Br>(tc * TN + c, tr * TN)]) = p4;
         }
-        __syncthreads();                         // everyone done with K; P visible
 
-        // V tile, row-major, into the same buffer as K
-        #pragma unroll
-        for (int e = 0; e < V_LOADS4; e++) {
-            const int f = e * NT + tx;
-            reinterpret_cast<float4*>(KVj)[f] = reinterpret_cast<const float4*>(Vb)[f];
+        if constexpr (SPLIT) {
+            __pipeline_wait_prior(0);            // this thread's V copies have arrived
+            __syncthreads();                     // everyone's V copies and P visible
+        } else {
+            __syncthreads();                     // everyone done with K; P visible
+            #pragma unroll
+            for (int e = 0; e < V_LOADS4; e++) {  // V tile, row-major, into K's buffer
+                const int f = e * NT + tx;
+                reinterpret_cast<float4*>(Vj)[f] = reinterpret_cast<const float4*>(Vb)[f];
+            }
+            __syncthreads();                     // V tile complete
         }
-        __syncthreads();                         // V tile complete
 
         // O = a * O + (b * P) V
         #pragma unroll
@@ -184,7 +212,7 @@ s2mm_kernel(int N, const float* Q, const float* K, const float* V, float* O, flo
             const float p[TN] = {p4.x, p4.y, p4.z, p4.w};
             #pragma unroll
             for (int q = 0; q < DCH; q++) {
-                const float4 v4 = *reinterpret_cast<const float4*>(&KVj[c * d + q * TC * TN + tc * TN]);
+                const float4 v4 = *reinterpret_cast<const float4*>(&Vj[c * d + q * TC * TN + tc * TN]);
                 const float v[TN] = {v4.x, v4.y, v4.z, v4.w};
                 #pragma unroll
                 for (int r = 0; r < TN; r++)
