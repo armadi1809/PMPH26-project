@@ -9,3 +9,4 @@ futhark/smoke.c
 futhark/smoke.h
 data/
 attention-cuda/attention
+build/
