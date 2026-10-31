@@ -353,6 +353,7 @@ int main(int argc, char **argv)
     fprintf(stderr, "Device bytes to allocate: %zu\n",
             4 * cnt * sizeof(float));
 
+    struct timeval ts, te;
     double dur = 0.0;
     {
         float *Q_d, *K_d, *V_d, *O_d;
@@ -376,24 +377,16 @@ int main(int argc, char **argv)
         fprintf(stderr, "Running s2mm...");
         fprintf(stderr, "Printing runtimes to stdout\n");
 
-        cudaEvent_t start, stop;
-        gpuAssert(cudaEventCreate(&start));
-        gpuAssert(cudaEventCreate(&stop));
-
+        // Wall-clock timing, as on the aziz-improvements branch
         for (int it = 0; it < runs; it++) {
-            gpuAssert(cudaEventRecord(start));
+            gettimeofday(&ts, NULL);
             s2mm(O_d, Q_d, K_d, V_d, N, d);
-            gpuAssert(cudaEventRecord(stop));
-            gpuAssert(cudaEventSynchronize(stop));
-
-            float ms;
-            gpuAssert(cudaEventElapsedTime(&ms, start, stop));
-            dur = ms / 1e3;
+            gpuAssert(cudaDeviceSynchronize());
+            gettimeofday(&te, NULL);
+            dur = (double)(te.tv_usec - ts.tv_usec) / 1e6 +
+                  (double)(te.tv_sec - ts.tv_sec);
             printf("%f\n", dur);
         }
-
-        gpuAssert(cudaEventDestroy(start));
-        gpuAssert(cudaEventDestroy(stop));
 
         gpuAssert(cudaMemcpy(O, O_d, cnt*sizeof(float), cudaMemcpyDeviceToHost));
         gpuAssert(cudaDeviceSynchronize());
