@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Compare correctness and performance of the three implementations on data/:
 #   original  original-cuda/flash_attention_gpu
-#   attention attention-cuda/main.cu
+#   tensor    attention-cuda/main_tensor.cu (TF32 tensor cores, needs sm_80)
 #   futhark   futhark/custom-alg1-opt.fut (also produces the reference outputs)
 # Usage: ./compare.sh [d,N ...]   (env: RUNS=10, DEVICE=0)
 set -euo pipefail
@@ -12,12 +12,12 @@ RUNS="${RUNS:-10}"
 export CUDA_VISIBLE_DEVICES="${DEVICE:-0}"
 
 ORIG=original-cuda/flash_attention_gpu
-ATTN=attention-cuda/attention
+TENSOR=attention-cuda/attention_tensor
 FUT=futhark/build/custom-alg1-opt-cuda
 
 make -C original-cuda compile
 make -C futhark compile BACKEND=cuda
-nvcc -O3 -diag-suppress=1650 -o "$ATTN" attention-cuda/main.cu
+nvcc -O3 -diag-suppress=1650 -arch=sm_80 -o "$TENSOR" attention-cuda/main_tensor.cu
 
 # Median of a file with one number per line, scaled by $2.
 median() {
@@ -49,25 +49,25 @@ for size in $SIZES; do
 
   echo "d=$d N=$n" >&2
   read -r orig_ms orig_ok < <(run_cuda "$ORIG" "$d" "$n" "$f" orig)
-  read -r attn_ms attn_ok < <(run_cuda "$ATTN" "$d" "$n" "$f" attn)
+  read -r tensor_ms tensor_ok < <(run_cuda "$TENSOR" "$d" "$n" "$f" tensor)
 
   # Futhark -t records one runtime (microseconds) per run.
   "$FUT" --entry-point="main$d" -b -r "$RUNS" -t "$f.fut.times" < "$f.in" > /dev/null
   fut_ms="$(median "$f.fut.times" 0.001)"
 
-  rows+=("$d $n $orig_ms $orig_ok $attn_ms $attn_ok $fut_ms")
+  rows+=("$d $n $orig_ms $orig_ok $tensor_ms $tensor_ok $fut_ms")
 done
 
-printf '\n| %3s | %6s | %13s | %8s | %14s | %8s | %12s |\n' \
-  d N "original (ms)" "original" "attention (ms)" "attention" "futhark (ms)"
-printf '| --: | -----: | ------------: | :------: | -------------: | :------: | -----------: |\n'
+printf '\n| %3s | %6s | %13s | %8s | %11s | %6s | %12s |\n' \
+  d N "original (ms)" "original" "tensor (ms)" "tensor" "futhark (ms)"
+printf '| --: | -----: | ------------: | :------: | ----------: | :----: | -----------: |\n'
 status=0
 for row in "${rows[@]}"; do
-  read -r d n om ook am aok fm <<< "$row"
-  printf '| %3s | %6s | %13s | %8s | %14s | %8s | %12s |\n' "$d" "$n" "$om" "$ook" "$am" "$aok" "$fm"
-  [ "$ook" = OK ] && [ "$aok" = OK ] || status=1
+  read -r d n om ook tm tok fm <<< "$row"
+  printf '| %3s | %6s | %13s | %8s | %11s | %6s | %12s |\n' "$d" "$n" "$om" "$ook" "$tm" "$tok" "$fm"
+  [ "$ook" = OK ] && [ "$tok" = OK ] || status=1
 done
 echo
 echo "Correctness is checked with futhark datacmp against data/*.out (Futhark reference)."
-echo "Medians over $RUNS runs. Mismatch details: data/*.{orig,attn}.cmp, logs: data/*.{orig,attn}.log"
+echo "Medians over $RUNS runs. Mismatch details: data/*.{orig,tensor}.cmp, logs: data/*.{orig,tensor}.log"
 exit "$status"
