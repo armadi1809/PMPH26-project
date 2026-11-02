@@ -9,7 +9,9 @@ cd "$(dirname "$0")"
 
 SIZES="${*:-64,1024 128,1024 64,16384 64,32768 128,8192 128,16384}"
 RUNS="${RUNS:-10}"
-export CUDA_VISIBLE_DEVICES="${DEVICE:-0}"
+GPU="${DEVICE:-0}"
+export CUDA_DEVICE_ORDER=PCI_BUS_ID       # same GPU numbering as nvidia-smi
+export CUDA_VISIBLE_DEVICES="$GPU"
 
 ORIG=original-cuda/flash_attention_gpu
 TENSOR=attention-cuda/attention_tensor
@@ -31,6 +33,7 @@ median() {
 run_cuda() {
   local exe="$1" d="$2" n="$3" f="$4" tag="$5"
   local times="$f.$tag.times" res="$f.$tag.res"
+  "$exe" "$d" "$n" 3 "$f.in" "$res" > /dev/null 2>&1 || true      # warm-up
   if ! "$exe" "$d" "$n" "$RUNS" "$f.in" "$res" > "$times" 2> "$f.$tag.log"; then
     echo "- CRASH"
     return
@@ -41,11 +44,29 @@ run_cuda() {
 }
 
 mkdir -p data
+for size in $SIZES; do
+  f="data/d${size%,*}-N${size#*,}"
+  [ -f "$f.in" ] && [ -f "$f.out" ] || ./gen-datasets.sh "$size"
+done
+
+# The GPUs run without persistence mode, and an idle GPU needs a few seconds of
+# load to reach full speed (the first runs can be up to 1.8x slower). Keep the
+# driver loaded, and warm the GPU up with the baseline before measuring anything.
+nvidia-smi -i "$GPU" -l 1 > /dev/null 2>&1 &
+KEEPALIVE=$!
+trap 'kill "$KEEPALIVE" 2>/dev/null || true' EXIT
+first="${SIZES%% *}"
+warm="data/d${first%,*}-N${first#*,}"
+end=$((SECONDS + 5))
+while [ "$SECONDS" -lt "$end" ]; do
+  "$ORIG" "${first%,*}" "${first#*,}" "$RUNS" "$warm.in" "$warm.warmup.res" > /dev/null 2>&1 || true
+done
+rm -f "$warm.warmup.res"
+
 rows=()
 for size in $SIZES; do
   d="${size%,*}" n="${size#*,}"
   f="data/d$d-N$n"
-  [ -f "$f.in" ] && [ -f "$f.out" ] || ./gen-datasets.sh "$size"
 
   echo "d=$d N=$n" >&2
   read -r orig_ms orig_ok < <(run_cuda "$ORIG" "$d" "$n" "$f" orig)
