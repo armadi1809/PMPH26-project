@@ -31,7 +31,9 @@ GPU="${DEVICE:-0}"
 export CUDA_DEVICE_ORDER=PCI_BUS_ID       # same GPU numbering as nvidia-smi
 export CUDA_VISIBLE_DEVICES="$GPU"
 
-NVCCFLAGS=(-O3 -diag-suppress=1650)      # same as compare.sh
+# sm_80 is the A100. Without it, nvcc targets an older GPU, the driver JIT-compiles
+# the kernels, and cp.async falls back to plain copies.
+NVCCFLAGS=(-O3 -diag-suppress=1650 -arch=sm_80)
 
 # Report sections, in order.
 SECTION_TITLES=(
