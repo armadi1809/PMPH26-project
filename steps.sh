@@ -63,7 +63,7 @@ STEPS=(
   "7|1dbb008|Cap thread blocks per SM"
   "7|9d9285e|Keep k-loops rolled"
   "8|595a3f9|Swizzled shared-memory layouts"
-  "9|6fe99d7|Prefetch V with cp.async"
+  "9|d2f8d43|Prefetch V with cp.async"
 )
 
 BUILD=build/steps
