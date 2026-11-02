@@ -61,7 +61,6 @@ STEPS=(
   "6|993c7d7|Alias K and V in shared memory"
   "7|5eda946|Unroll fixed-trip-count loops"
   "7|1dbb008|Cap thread blocks per SM"
-  "7|978f0ce|(timing only: CUDA events, same kernel)"
   "7|9d9285e|Keep k-loops rolled"
   "8|595a3f9|Swizzled shared-memory layouts"
   "9|6fe99d7|Prefetch V with cp.async"
@@ -85,6 +84,24 @@ done
 make -C original-cuda compile
 ORIG=original-cuda/flash_attention_gpu
 
+# Commits 978f0ce to 6fe99d7 time the kernel with CUDA events, all other versions
+# and the baseline with gettimeofday. Swap the event loop of a source for the
+# gettimeofday loop, so that every version is timed the same way.
+use_gettimeofday() {
+  perl -0pi -e 's{^[ \t]*cudaEvent_t start, stop;.*?cudaEventDestroy\(stop\)\);\n}{        for (int it = 0; it < runs; it++) {
+            struct timeval ts, te;
+            gettimeofday(&ts, NULL);
+            s2mm(m_d, l_d, O_d, Q_d, K_d, V_d, N, d);
+            gpuAssert(cudaDeviceSynchronize());
+            gettimeofday(&te, NULL);
+            dur = (double)(te.tv_usec - ts.tv_usec) / 1e6 +
+                  (double)(te.tv_sec - ts.tv_sec);
+            printf("%f\\n", dur);
+        }
+}ms' "$1"
+  ! grep -q cudaEvent "$1"
+}
+
 echo "Building ${#STEPS[@]} versions (nvcc ${NVCCFLAGS[*]})..." >&2
 pids=()
 for step in "${STEPS[@]}"; do
@@ -93,6 +110,7 @@ for step in "${STEPS[@]}"; do
   (
     rm -rf "$dir" && mkdir -p "$dir"
     git archive "$commit" attention-cuda utils | tar -x -C "$dir"
+    use_gettimeofday "$dir/attention-cuda/main.cu" || { echo "timing swap failed" > "$dir/build.log"; exit 1; }
     nvcc "${NVCCFLAGS[@]}" -o "$dir/attention" "$dir/attention-cuda/main.cu" > "$dir/build.log" 2>&1
   ) &
   pids+=("$!")
@@ -230,7 +248,6 @@ awk -F'\t' '
     }
     print "\nms: lowest of the per-round medians. Spread: how much slower the slowest round was (large = disturbed)."
     print "Checks: futhark datacmp against data/*.out, first round."
-    print "Steps before 978f0ce are timed with gettimeofday + cudaDeviceSynchronize, later ones with CUDA events;"
-    print "the 978f0ce row (same kernel as 1dbb008) shows the size of that difference."
+    print "All versions and the baseline are timed with gettimeofday + cudaDeviceSynchronize."
   }
 ' "$TSV"
