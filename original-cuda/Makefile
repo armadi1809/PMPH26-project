@@ -2,7 +2,7 @@
 
 NVCC ?= nvcc
 NVCCFLAGS ?= -O3 -diag-suppress=1650
-ARCH ?=
+ARCH ?= sm_80
 DEVICE ?= 0
 D ?= 64
 N ?= 1024

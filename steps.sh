@@ -31,7 +31,9 @@ GPU="${DEVICE:-0}"
 export CUDA_DEVICE_ORDER=PCI_BUS_ID       # same GPU numbering as nvidia-smi
 export CUDA_VISIBLE_DEVICES="$GPU"
 
-NVCCFLAGS=(-O3 -diag-suppress=1650)      # same as compare.sh
+# sm_80 is the A100. Without it, nvcc targets an older GPU, the driver JIT-compiles
+# the kernels, and cp.async falls back to plain copies.
+NVCCFLAGS=(-O3 -diag-suppress=1650 -arch=sm_80)
 
 # Report sections, in order.
 SECTION_TITLES=(
@@ -59,10 +61,9 @@ STEPS=(
   "6|90f4de5|Alias K and V in shared memory"
   "7|d50b6c8|Unroll fixed-trip-count loops"
   "7|7fcb41d|Cap thread blocks per SM"
-  "7|978f0ce|(timing only: CUDA events, same kernel)"
-  "7|9d9285e|Keep k-loops rolled"
-  "8|595a3f9|Swizzled shared-memory layouts"
-  "9|6fe99d7|Prefetch V with cp.async"
+  "7|706b62f|Keep k-loops rolled"
+  "8|4d0dd5d|Swizzled shared-memory layouts"
+  "9|b6218aa|Prefetch V with cp.async"
 )
 
 BUILD=build/steps
@@ -228,7 +229,6 @@ awk -F'\t' '
     }
     print "\nms: lowest of the per-round medians. Spread: how much slower the slowest round was (large = disturbed)."
     print "Checks: futhark datacmp against data/*.out, first round."
-    print "Steps before 978f0ce are timed with gettimeofday + cudaDeviceSynchronize, later ones with CUDA events;"
-    print "the 978f0ce row (same kernel as 7fcb41d) shows the size of that difference."
+    print "All versions and the baseline are timed with gettimeofday + cudaDeviceSynchronize."
   }
 ' "$TSV"
