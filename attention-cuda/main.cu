@@ -34,8 +34,9 @@ struct SmemLayout {
     static constexpr int Q     = Br * D;              // Q tile, transposed: D rows of Br (swizzled)
     static constexpr int K     = Bc * D;              // K tile, transposed: D rows of Bc (swizzled)
     static constexpr int V     = SPLIT ? Bc * D : 0;  // V tile, row-major (own buffer only if SPLIT)
-    static constexpr int S     = Bc * Br;             // P tile, transposed: Bc rows of Br (swizzled)
+    static constexpr int S     = SPLIT ? 0 : Bc * Br; // P tile, transposed: Bc rows of Br (swizzled), in K's buffer if SPLIT
     static constexpr int TOTAL = Q + K + V + S;
+    static_assert(!SPLIT || K >= Bc * Br, "P must fit into the K buffer");
 };
 
 // Index into a transposed tile with W floats per row: group (x / 4) of row k
@@ -81,8 +82,7 @@ s2mm_kernel(int N, const float* Q, const float* K, const float* V, float* O, flo
     float* Qi  = smem;
     float* Kj  = Qi + L::Q;
     float* Vj  = SPLIT ? Kj + L::K : Kj;         // own buffer, or aliased with K
-    // float* Sij = Kj + L::K + L::V;
-    float* Sij = SPLIT ? Kj : Kj + L::K + L::V;
+    float* Sij = SPLIT ? Kj : Kj + L::K;         // P reuses K's buffer once Q K^T is done
 
     const int tx = threadIdx.x;
     const int tr = tx / TC;
