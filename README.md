@@ -1,79 +1,95 @@
-# PMPH26 FlashAttention project
+# FlashAttention on the A100
 
-Programming Massively Parallel Hardware course project. The goal is to develop
-and optimize our own CUDA FlashAttention implementation and compare it against some baselines like the cuda and futhark ones here.
+Course project for PMPH.
+We implement FlashAttention-2, optimize it step by step on the CUDA cores, and
+then move both matrix products to the TF32 tensor cores. We compare against the CUDA and
+Futhark baselines of the CFAL paper.
 
-## TODO
+All programs compute unscaled, non-causal, non-batched single-head attention in FP32,
+`O = softmax(Q K^T) V`, with `Q`, `K`, `V` of size `N x d`. There is no `1/sqrt(d)`
+scaling, mask or batch dimension.
 
-1. Tiling and thread/warp mapping
-2. Tensor Core utilization
-3. Coalesced + vectorized memory access
-4. Shared-memory layout and bank conflicts
-5. Warp-level reductions and communication
-6. Synchronization and load/compute pipelining (cp.async)
-7. Register pressure, occupancy, and SM utilization
-8. Profiling + iterative parameter tuning
+## Repository layout
 
-## Quick start on the GPU machine
+| Path | Contents |
+| :-- | :-- |
+| `attention-cuda/main.cu` | Our final CUDA core kernel (the last optimization step) |
+| `attention-cuda/main_tensor.cu` | Our TF32 tensor core kernel (needs `sm_80`) |
+| `original-cuda/` | CUDA baseline |
+| `futhark/` | Futhark baseline, which also produces the reference outputs |
+| `utils/utils.cuh` | Shared host code for reading inputs, writing outputs and error checks |
+| `gen-datasets.sh` | Generates random inputs and reference outputs in `data/` |
+| `compare.sh` | Checks and times the CUDA baseline, the tensor core kernel and Futhark |
+| `steps.sh` | Builds, checks and times every optimization step from its commit |
 
-```sh
-cd PMPH26-project
-make -C cuda compile
-make -C cuda run D=64 N=1024
-make -C cuda test
-make -C cuda bench
+## Requirements
 
-make -C futhark compile
-make -C futhark run D=64 N=1024
-make -C futhark test
-make -C futhark bench
-```
+An NVIDIA A100 (or another `sm_80` GPU), `nvcc`, and `futhark` on the `PATH`.
+Futhark generates the datasets and checks every output with `futhark datacmp`.
 
-`compile` is the default target in each subfolder. `run` is a small standalone
-execution; `bench` uses the following four baseline workloads:
-
-| Head dimension `d` | Sequence length `N` |
-| ------------------ | ------------------- |
-| 64                 | 16384               |
-| 64                 | 32768               |
-| 128                | 8192                |
-| 128                | 16384               |
-
-Those full benchmarks are intentionally large. Start with `run` or `test`.
-For a CPU-only Futhark use:
+## Running the benchmarks
 
 ```sh
-make -C futhark check
-make -C futhark test BACKEND=c
-make -C futhark run BACKEND=multicore D=64 N=1024 THREADS=4
-make -C futhark bench_smoke BACKEND=c RUNS=1
+DEVICE=0 ./compare.sh 64,16384 64,32768 128,8192 128,16384
+DEVICE=0 ./steps.sh
 ```
 
-## What is being compared
+Both scripts take dataset sizes as `d,N` arguments and generate missing datasets
+themselves. `steps.sh` defaults to the four benchmark sizes above. Environment variables:
+`DEVICE` (GPU index as in `nvidia-smi`, default 0), `RUNS` (timed runs per measurement,
+default 10) and `ROUNDS` (default 3).
 
-Both baselines calculate **unscaled, non-causal, single-head attention**:
+Every program does a warm-up run and is then timed `RUNS` times with `gettimeofday` (same as baseline)
+around the kernel launch and `cudaDeviceSynchronize`. Each measurement is repeated in
+`ROUNDS` rounds, and the scripts report the lowest of the round medians together with
+the spread between the rounds. Check
+`nvidia-smi` for other jobs before measuring, as it yields dubious numbers if other processes are using it as well.
+`results/steps.tsv` and `results/steps-raw.tsv`.
 
-```text
-O = softmax(Q K^T) V
+## Optimization steps
+
+Every step is a commit on this branch. `steps.sh` builds each of them directly from git,
+without a checkout.
+
+| # | Step | Commit |
+| --: | :-- | :-- |
+| 1 | Naive implementation | `0e114a0` |
+| 2 | Switch loop order | `71f546a` |
+| 3 | Pad K tile | `43e725d` |
+| 4 | Register tiling of `Q K^T` | `006ad39` |
+| 5 | Register tiling of `P V`, `O` in registers | `61fac95` |
+| 6 | Online softmax in registers | `58ab269` |
+| 7 | Reduce register pressure in `O` update | `05d7012` |
+| 8 | Alias K and V in shared memory | `90f4de5` |
+| 9 | Unroll fixed-trip-count loops | `d50b6c8` |
+| 10 | Cap thread blocks per SM | `7fcb41d` |
+| 11 | Keep k-loops rolled | `706b62f` |
+| 12 | Swizzled shared-memory layouts | `4d0dd5d` |
+| 13 | Prefetch V with `cp.async` | `b6218aa` |
+| | TF32 tensor cores (first version, cleaned up in `44d942b`) | `e760a85` |
+
+## Navigating the versions
+
+To read a version or see what a step changed, no checkout is needed:
+
+```sh
+git show 4d0dd5d:attention-cuda/main.cu                    # the kernel of step 12
+git diff 706b62f 4d0dd5d -- attention-cuda/main.cu         # what step 12 changed
 ```
 
-There is no `1/sqrt(d)` scaling, causal mask, dropout, or batch dimension.
-The supplied workloads fill `Q`, `K`, and `V` with ones; the expected output is
-an `N x d` matrix of ones. Our optimized CUDA implementation must match this
-operation and these sizes for comparable timings.
+To build and run a version, check out its commit, then return to the branch:
 
-- The CUDA baseline emits one runtime in **seconds** per line, with 50 measured
-  runs by default after one warmup. These are host wall-clock measurements
-  around a kernel launch and device synchronization, excluding input generation
-  and host/device transfers. `bench` saves them under [cuda/results/](cuda/results/).
-- Futhark uses default parameters and `futhark bench`, including its own warmup
-  and statistical methodology. Its JSON `runtimes` are in **microseconds**. The default benchmark
-  selects `main64` and `main128`, which return the attention output, rather than
-  timing the extra L2 reduction in `validate`. Results go under
-  [futhark/results/](futhark/results/).
-  Use `make -C futhark bench ENTRIES=validate` to include the validation
-  reduction in the timing instead.
-- The Futhark baseline computes a `d x N` score block and uses a chunked online
-  softmax before multiplying by `V`. It is not the same tiled/fused kernel as
-  the CUDA baseline, so their intermediate memory use and execution strategy
-  differ.
+```sh
+./gen-datasets.sh 64,16384                                 # once, if data/ is empty
+git checkout 4d0dd5d
+mkdir -p build
+nvcc -O3 -arch=sm_80 -o build/attention attention-cuda/main.cu
+build/attention 64 16384 10 data/d64-N16384.in build/out.res   # d N runs input output
+futhark datacmp build/out.res data/d64-N16384.out              # compare to the reference
+git checkout krebso/submission
+```
+
+Each program prints one runtime in seconds per line.
+`d` must be 64 or 128, and `N` a multiple of `d`.
+The tensor core kernel is built the same way from `attention-cuda/main_tensor.cu`.
+Older commits also contain older versions of the scripts, so always measure with `steps.sh` and `compare.sh` from the latest commit.
