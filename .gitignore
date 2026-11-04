@@ -9,3 +9,5 @@ futhark/smoke.c
 futhark/smoke.h
 data/
 attention-cuda/attention
+build/
+attention-cuda/attention_tensor

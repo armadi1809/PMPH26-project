@@ -12,206 +12,264 @@
 #include <limits.h>
 #include <sys/time.h>
 #include <cuda_runtime.h>
+#include <cuda_pipeline.h>
 #include "../utils/utils.cuh"
 
 #define GPU_RUNS 50
 #define CEIL_DIV(x, y) ((x) >= 0 ? (((x) + (y) - 1) / (y)) : ((x) / (y)))
 
-float* allocate_host_memory(size_t cnt) {
-    float * ptr;
-    if ((ptr = (float*) calloc(cnt, sizeof(float))) == NULL) {
-        return NULL;
-    }
+// All tiles are 64 wide, and N must be a multiple of 64.
+// This lets the kernel drop every bounds check.
+constexpr int TILE = 64;
 
-    return ptr;
+// For d = 64, K and V get separate buffers, and the V tile is prefetched with
+// cp.async while Q K^T runs. For d = 128, K and V share one buffer (as before),
+// to keep 2 blocks per SM.
+template <int D>
+struct PrefetchV { static constexpr bool value = (D == 64); };
+
+template <int Br, int Bc, int D>
+struct SmemLayout {
+    static constexpr bool SPLIT = PrefetchV<D>::value;
+    static constexpr int Q     = Br * D;              // Q tile, transposed: D rows of Br (swizzled)
+    static constexpr int K     = Bc * D;              // K tile, transposed: D rows of Bc (swizzled)
+    static constexpr int V     = SPLIT ? Bc * D : 0;  // V tile, row-major (own buffer only if SPLIT)
+    static constexpr int S     = SPLIT ? 0 : Bc * Br; // P tile, transposed: Bc rows of Br (swizzled), in K's buffer if SPLIT
+    static constexpr int TOTAL = Q + K + V + S;
+    static_assert(!SPLIT || K >= Bc * Br, "P must fit into the K buffer");
+};
+
+// Index into a transposed tile with W floats per row: group (x / 4) of row k
+// is stored at position (x / 4) XOR (k mod W/4).
+template <int W>
+__device__ __forceinline__ int swz(int k, int x) {
+    constexpr int G = W / 4;
+    static_assert((G & (G - 1)) == 0, "groups per row must be a power of 2");
+    return k * W + ((((x >> 2) ^ (k & (G - 1))) << 2) | (x & 3));
 }
 
+float* allocate_host_memory(size_t cnt) {
+    return (float*) calloc(cnt, sizeof(float));
+}
 
-template <int Br, int Bc, int mul>
-// __global__ void __launch_bounds__((Br * Bc) / (Tile_r * Tile_c), 1) // TODO: check if we need something else
-__global__ void __launch_bounds__(Br * Bc) s2mm_kernel(int N, int d, const float* Q, const float* K, const float* V, float* O, float *m, float*l) {
-    int tx = threadIdx.x;
-    int bx = blockIdx.x;
-    int by = blockIdx.y;
+// m and l are unused (the statistics live in registers); they are kept so the
+// kernel signature, and therefore its mangled name, stays the same.
+template <int Br, int Bc, int TN, int d>
+__global__ void __launch_bounds__((Br / TN) * (Bc / TN))
+s2mm_kernel(int N, const float* Q, const float* K, const float* V, float* O, float* m, float* l)
+{
+    constexpr int NT  = (Br / TN) * (Bc / TN);   // threads per block: 256
+    constexpr int TC  = Bc / TN;                 // thread-columns: 16
+    constexpr int DCH = d / (TC * TN);           // output column chunks per thread: 1 or 2
+    constexpr int KCH = TILE;                    // length of the fully unrolled Q K^T chunk
 
-    int Tr = CEIL_DIV(N, Br);
-    int Tc = CEIL_DIV(N, Bc);
+    constexpr int Q_LOADS  = Br * d / NT;        // scalar loads per thread for the Q tile
+    constexpr int K_LOADS  = Bc * d / NT;        // scalar loads per thread for a K tile
+    constexpr int V_LOADS4 = Bc * d / 4 / NT;    // 16-byte loads per thread for a V tile
 
-    // Single head: blocks split the row tiles i, all read the same Q, K, V.
-    int qkv_off = 0;
-    int lm_off = 0;
+    using L = SmemLayout<Br, Bc, d>;
+    constexpr bool SPLIT = L::SPLIT;
 
-    extern __shared__ float smem[];
-    float* Qi = smem;
-    float* Kj = Qi + Br * d;
-    float* Vj = Kj + Bc * d;
-    float* Sij = Vj + Bc * d;
-    float* Oi = Sij + Br * Bc;
-    float* li = Oi + Br * d;
-    float* li_new = li + Br;
-    float* mi = li_new + Br;
-    float* mi_new = mi + Br;
-    float* mij_dash = mi_new + Br;
+    static_assert(TN == 4, "float4 accesses assume TN == 4");
+    static_assert(Br == TILE && Bc == TILE, "tiles are fixed at 64");
+    static_assert(d % KCH == 0, "d must be a multiple of 64");
+    static_assert(d % (TC * TN) == 0, "d must be a multiple of TC * TN");
+    static_assert((Br * d) % NT == 0, "Q tile must divide evenly among threads");
+    static_assert((Bc * d) % (4 * NT) == 0, "K/V tiles must divide evenly among threads");
+    static_assert(TC <= 32 && (TC & (TC - 1)) == 0, "row group must fit in a warp, power of 2");
+
+    extern __shared__ __align__(16) float smem[];
+    float* Qi  = smem;
+    float* Kj  = Qi + L::Q;
+    float* Vj  = SPLIT ? Kj + L::K : Kj;         // own buffer, or aliased with K
+    float* Sij = SPLIT ? Kj : Kj + L::K;         // P reuses K's buffer once Q K^T is done
+
+    const int tx = threadIdx.x;
+    const int tr = tx / TC;
+    const int tc = tx % TC;
+    const int Tc = N / Bc;
+    const int i  = blockIdx.x;
+
+    // Q tile: element idx of the tile is row idx / d, column idx % d,
+    // and it sits at global offset idx from the tile's start.
+    const float* Qb = Q + (size_t)i * Br * d;
+    #pragma unroll
+    for (int e = 0; e < Q_LOADS; e++) {
+        const int idx = e * NT + tx;
+        Qi[swz<Br>(idx % d, idx / d)] = Qb[idx];
+    }
+    // (the barrier at the top of the j loop makes the Q tile visible)
+
+    float o[DCH][TN][TN] = {};
+    float m_reg[TN], l_reg[TN];
+    #pragma unroll
+    for (int r = 0; r < TN; r++) { m_reg[r] = -INFINITY; l_reg[r] = 0.f; }
 
     for (int j = 0; j < Tc; j++) {
-        __syncthreads();
-        int loads_per_thread = CEIL_DIV(d, Br);
-        for (int e = 0; e < loads_per_thread; e++) {
-            int idx = e * (Br * Bc) + tx;
-            if (idx < Bc * d) {
-                int row = idx / d;
-                int col = idx % d;
+        const float* Kb = K + (size_t)j * Bc * d;
+        const float* Vb = V + (size_t)j * Bc * d;
 
-                if (j * Bc + row < N) {
-                    Kj[row * d + col] = K[qkv_off + (j * Bc + row) * d + col];
-                    Vj[row * d + col] = V[qkv_off + (j * Bc + row) * d + col];
-                }
+        __syncthreads();                         // previous P V is done with Kj, Vj and Sij
+
+        // K tile, stored transposed and swizzled
+        #pragma unroll
+        for (int e = 0; e < K_LOADS; e++) {
+            const int idx = e * NT + tx;
+            Kj[swz<Bc>(idx % d, idx / d)] = Kb[idx];
+        }
+
+        // Start copying the V tile into its own buffer; it arrives while Q K^T runs
+        if constexpr (SPLIT) {
+            #pragma unroll
+            for (int e = 0; e < V_LOADS4; e++) {
+                const int f = e * NT + tx;
+                __pipeline_memcpy_async(&Vj[f * 4], &Vb[f * 4], 16);
+            }
+            __pipeline_commit();
+        }
+        __syncthreads();                         // K tile complete
+
+        // S = Q K^T: chunks of 64 steps, each fully unrolled
+        float s[TN][TN] = {};
+        #pragma unroll 1
+        for (int k0 = 0; k0 < d; k0 += KCH) {
+            #pragma unroll
+            for (int kk = 0; kk < KCH; kk++) {
+                const int k = k0 + kk;
+                const float4 q4 = *reinterpret_cast<const float4*>(&Qi[swz<Br>(k, tr * TN)]);
+                const float4 k4 = *reinterpret_cast<const float4*>(&Kj[swz<Bc>(k, tc * TN)]);
+                const float q[TN]  = {q4.x, q4.y, q4.z, q4.w};
+                const float kv[TN] = {k4.x, k4.y, k4.z, k4.w};
+                #pragma unroll
+                for (int r = 0; r < TN; r++)
+                    #pragma unroll
+                    for (int c = 0; c < TN; c++)
+                        s[r][c] += q[r] * kv[c];
             }
         }
-        __syncthreads();
 
-        for (int i = bx; i < Tr; i += gridDim.x) {
-            for (int e = 0; e < loads_per_thread; e++) {
-                int idx = e * (Br * Bc) + tx;
-                if (idx < Br * d) {
-                    int row = idx / d;
-                    int col = idx % d;
-                    if (i * Br + row < N) {
-                        Qi[row * d + col] = Q[qkv_off + (i * Br + row) * d + col];
-                        Oi[row * d + col] = j == 0 ? 0.f : O[qkv_off + (i * Br + row) * d + col];
-                    }
-                }
+        // Online softmax in registers (no masking: N is a multiple of 64)
+        float a[TN], b[TN];
+        #pragma unroll
+        for (int r = 0; r < TN; r++) {
+            float mx = s[r][0];
+            #pragma unroll
+            for (int c = 1; c < TN; c++) mx = fmaxf(mx, s[r][c]);
+            #pragma unroll
+            for (int off = TC / 2; off > 0; off >>= 1)
+                mx = fmaxf(mx, __shfl_xor_sync(0xffffffff, mx, off));
+
+            float sum = 0.f;
+            #pragma unroll
+            for (int c = 0; c < TN; c++) { s[r][c] = expf(s[r][c] - mx); sum += s[r][c]; }
+            #pragma unroll
+            for (int off = TC / 2; off > 0; off >>= 1)
+                sum += __shfl_xor_sync(0xffffffff, sum, off);
+
+            const float m_new = fmaxf(m_reg[r], mx);
+            const float l_new = expf(m_reg[r] - m_new) * l_reg[r] + expf(mx - m_new) * sum;
+            const float inv_l = 1.f / l_new;
+            a[r] = l_reg[r] * expf(m_reg[r] - m_new) * inv_l;
+            b[r] = expf(mx - m_new) * inv_l;
+            m_reg[r] = m_new;
+            l_reg[r] = l_new;
+        }
+
+        if constexpr (SPLIT) __syncthreads();
+        // Publish b * P, transposed and swizzled: one float4 per key
+        #pragma unroll
+        for (int c = 0; c < TN; c++) {
+            const float4 p4 = make_float4(s[0][c] * b[0], s[1][c] * b[1],
+                                          s[2][c] * b[2], s[3][c] * b[3]);
+            *reinterpret_cast<float4*>(&Sij[swz<Br>(tc * TN + c, tr * TN)]) = p4;
+        }
+
+        if constexpr (SPLIT) {
+            __pipeline_wait_prior(0);            // this thread's V copies have arrived
+            __syncthreads();                     // everyone's V copies and P visible
+        } else {
+            __syncthreads();                     // everyone done with K; P visible
+            #pragma unroll
+            for (int e = 0; e < V_LOADS4; e++) {  // V tile, row-major, into K's buffer
+                const int f = e * NT + tx;
+                reinterpret_cast<float4*>(Vj)[f] = reinterpret_cast<const float4*>(Vb)[f];
             }
-        
-            int s_row = tx / Bc;
-            int s_col = tx % Bc;
+            __syncthreads();                     // V tile complete
+        }
 
-            if (s_col == 0) {
-                mi[s_row] = j == 0 ? -INFINITY : m[lm_off + (i * Br) + s_row];
-                li[s_row] = j == 0 ? 0.f : l[lm_off + (i * Br) + s_row];
+        // O = a * O + (b * P) V
+        #pragma unroll
+        for (int r = 0; r < TN; r++)
+            #pragma unroll
+            for (int q = 0; q < DCH; q++)
+                #pragma unroll
+                for (int cc = 0; cc < TN; cc++)
+                    o[q][r][cc] *= a[r];
+
+        #pragma unroll
+        for (int c = 0; c < Bc; c++) {
+            const float4 p4 = *reinterpret_cast<const float4*>(&Sij[swz<Br>(c, tr * TN)]);
+            const float p[TN] = {p4.x, p4.y, p4.z, p4.w};
+            #pragma unroll
+            for (int q = 0; q < DCH; q++) {
+                const float4 v4 = *reinterpret_cast<const float4*>(&Vj[c * d + q * TC * TN + tc * TN]);
+                const float v[TN] = {v4.x, v4.y, v4.z, v4.w};
+                #pragma unroll
+                for (int r = 0; r < TN; r++)
+                    #pragma unroll
+                    for (int cc = 0; cc < TN; cc++)
+                        o[q][r][cc] += p[r] * v[cc];
             }
-            __syncthreads();
-
-            float acc = 0.f;
-            for (int k = 0; k < d; k++)
-                acc += Qi[s_row * d + k] * Kj[s_col * d + k];
-
-            Sij[s_row * Bc + s_col] = acc;
-            __syncthreads();
-
-            if (s_col == 0) {
-                float row_m = -INFINITY, row_l = 0.f;
-                // Find max for numerical stability
-                for (int c = 0; c < Bc; c++) {
-                    float val = Sij[s_row * Bc + c];
-                    if (val > row_m) {
-                        row_m = val;
-                    }
-                }
-                // Compute exponentials and sum
-                for (int c = 0; c < Bc; c++) {
-                    float exp_val = expf(Sij[s_row * Bc + c] - row_m);
-                    Sij[s_row * Bc + c] = exp_val;
-                    row_l += exp_val;
-                }
-
-                // Update running max and sum
-                mij_dash[s_row] = row_m;
-                mi_new[s_row] = max(mi[s_row], row_m);
-                li_new[s_row] = expf(mi[s_row] - mi_new[s_row]) * li[s_row] + 
-                                expf(row_m - mi_new[s_row]) * row_l;
-            }
-            __syncthreads();
-
-            for (int col = s_col; col < d; col += Bc) {
-                float acc = 0.f;
-                for (int c = 0; c < Bc; c++)
-                    acc += Sij[s_row * Bc + c] * Vj[c * d + col];
-
-                int global_row = (i * Br) + s_row;
-                if (global_row < N) {
-                    Oi[s_row * d + col] = (1 / li_new[s_row]) * 
-                        ((li[s_row] * expf(mi[s_row] - mi_new[s_row]) * Oi[s_row * d + col]) + 
-                         (expf(mij_dash[s_row] - mi_new[s_row]) * acc));
-                    O[qkv_off + global_row * d + col] = Oi[s_row * d + col];
-                }
-            }
-
-            m[lm_off + (i * Br) + s_row] = mi_new[s_row];
-            l[lm_off + (i * Br) + s_row] = li_new[s_row];
-            __syncthreads();
         }
     }
+
+    // Write O straight from registers, one float4 per row and column chunk
+    float* Ob = O + (size_t)i * Br * d;
+    #pragma unroll
+    for (int r = 0; r < TN; r++)
+        #pragma unroll
+        for (int q = 0; q < DCH; q++)
+            *reinterpret_cast<float4*>(&Ob[(tr * TN + r) * d + q * TC * TN + tc * TN]) =
+                make_float4(o[q][r][0], o[q][r][1], o[q][r][2], o[q][r][3]);
 }
 
-template<int Br, int Bc, int mul>
-void setParamsAndCallKer(int N, int d, float *Q_d, float *K_d, float *V_d, float *O_d, float* m_d, float*l_d) {
-    // Assumptions: ( TN | BN ) && ( BN | d ) && ( TN^2 | BN ) && 
-    //              ( (BN / TN^2) | BN ) && ( BN >= TN^2 ) && (BN | N)
-    // TODO: come to this back later and fix it
-    // bool assert1 = (BN % TN) == 0;
-    // bool assert2 = (d % BN)  == 0;
-    // bool assert3 = (BN % (TN*TN)) == 0;
-    // bool assert4 = (BN % (BN / (TN*TN)))  == 0;
-    // bool assert5 = (BN >= (TN*TN));
-    // assert(assert1 && assert2 && assert3 && assert4 && assert5);
-
-    const int block_size = Br * Bc;
-
+template <int Br, int Bc, int TN, int d>
+void setParamsAndCallKer(int N, float *Q_d, float *K_d, float *V_d, float *O_d, float* m_d, float* l_d) {
+    constexpr int NT = (Br / TN) * (Bc / TN);
+    dim3 block(NT);
     dim3 grid(N / Br);
-    dim3 block(Br * Bc);
-    const size_t shmem_size = (
-        Br * d +        // Qi
-        2 * Bc * d +    // Kj, Vj
-        Br * Bc +       // Sij
-        Br * d +        // Oi
-        5 * Br          // li, li_new, mi, mi_new, mij_dash
-    ) * sizeof(float);
+    const size_t shmem_size = SmemLayout<Br, Bc, d>::TOTAL * sizeof(float);
 
-    // printf("N %d, d %d, BN %d, Bd %d, TN %d, mul %d, shmem %d\n", N, d, BN, Bd, TN, mul, shmem_size);
+    // One-time setup, done during the warm-up run so it stays out of the timed runs
+    static bool configured = false;
+    if (!configured) {
+        gpuAssert(cudaFuncSetAttribute(s2mm_kernel<Br, Bc, TN, d>,
+                  cudaFuncAttributeMaxDynamicSharedMemorySize, (int)shmem_size));
+        gpuAssert(cudaFuncSetAttribute(s2mm_kernel<Br, Bc, TN, d>,
+                  cudaFuncAttributePreferredSharedMemoryCarveout, cudaSharedmemCarveoutMaxShared));
+        int blocks_per_sm;
+        gpuAssert(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+                  &blocks_per_sm, s2mm_kernel<Br, Bc, TN, d>, NT, shmem_size));
+        fprintf(stderr, "d = %d: %d blocks per SM, %zu bytes of shared memory per block\n",
+                d, blocks_per_sm, shmem_size);
+        configured = true;
+    }
 
-    gpuAssert(cudaFuncSetAttribute(s2mm_kernel<Br, Bc, mul>, cudaFuncAttributeMaxDynamicSharedMemorySize, shmem_size));
-
-    s2mm_kernel<Br, Bc, mul><<<grid, block, shmem_size>>>(N, d, Q_d, K_d, V_d, O_d, m_d, l_d);
+    s2mm_kernel<Br, Bc, TN, d><<<grid, block, shmem_size>>>(N, Q_d, K_d, V_d, O_d, m_d, l_d);
     gpuAssert(cudaPeekAtLastError());
 }
 
 __host__ int
 s2mm(float* m_d, float* l_d, float *O_d, float *Q_d, float *K_d, float *V_d, int N, int d)
 {
-
-    const int M = 164 * 1024;    
-    const int Br = std::min(CEIL_DIV(M, 4 * d), d);
-    const int Bc = CEIL_DIV(M, 4 *d);
-
-
-    if(d == 128) {
-        setParamsAndCallKer<32,32,2>(N,d,Q_d,K_d,V_d,O_d,m_d, l_d);
+    if (d == 128) {
+        setParamsAndCallKer<64, 64, 4, 128>(N, Q_d, K_d, V_d, O_d, m_d, l_d);
     } else if (d == 64) {
-        setParamsAndCallKer<32,32,1>(N,d,Q_d,K_d,V_d,O_d,m_d, l_d);
+        setParamsAndCallKer<64, 64, 4, 64>(N, Q_d, K_d, V_d, O_d, m_d, l_d);
     } else {
         printf("Unsupported dataset, exiting!");
         exit(1);
     }
-
-    // cudaDeviceSynchronize();
-
-#if 0
-    {
-        float* m_h = (float*) malloc(N*sizeof(float));
-        cudaMemcpy(m_h, m_d, N*sizeof(float), cudaMemcpyDeviceToHost);
-        {
-            printf("(N,d,BN,TN)=(%d,%d,%d,%d), ms:\n    ", N,d,BN,TN);
-            for(int q=0; q<BN; q++) {
-                printf(", %f", m_h[q]);
-            }
-            printf("\n");
-        }
-
-        free(m_h);
-    }
-#endif
-
     return 0;
 }
 
@@ -220,7 +278,7 @@ int main(int argc, char **argv)
     int status = EXIT_SUCCESS;
     if (argc != 6) {
         fprintf(stderr, "Usage:\n");
-        fprintf(stderr, "  %s d N runs in_path out_path Compute with matrices filled with ones\n", argv[0]);        fprintf(stderr, "  %s d N runs in out Read Q, K, V from Futhark binary in, write O to out\n", argv[0]);
+        fprintf(stderr, "  %s d N runs in out Read Q, K, V from Futhark binary in, write O to out\n", argv[0]);
         return EXIT_FAILURE;
     }
 
@@ -237,6 +295,11 @@ int main(int argc, char **argv)
         return EXIT_FAILURE;
     }
 
+    if (N % TILE != 0) {
+        fprintf(stderr, "N must be a multiple of %d.\n", TILE);
+        return EXIT_FAILURE;
+    }
+
     if (N % d != 0) {
         fprintf(stderr, "d must divide N\n");
         return EXIT_FAILURE;
@@ -245,9 +308,8 @@ int main(int argc, char **argv)
     size_t cnt = (size_t)N * (size_t)d;
 
     fprintf(stderr, "\nN=%d, d=%d\n", N, d);
-
     fprintf(stderr, "Initializing data...");
-    
+
     float * Q = allocate_host_memory(cnt);
     float * K = allocate_host_memory(cnt);
     float * V = allocate_host_memory(cnt);
@@ -267,18 +329,16 @@ int main(int argc, char **argv)
     }
 
     fprintf(stderr, "done.\n");
-
     fprintf(stderr, "Device bytes to allocate: %zu\n",
             4 * cnt * sizeof(float) + 2 * (size_t)N * sizeof(float));
 
     struct timeval ts, te;
-    double dur;
+    double dur = 0.0;
     {
         float *Q_d, *K_d, *V_d, *O_d, *m_d, *l_d;
 
         gpuAssert(cudaSetDevice(0));
 
-        // allocate memory on device
         gpuAssert(cudaMalloc((void**) &Q_d, cnt*sizeof(float)));
         gpuAssert(cudaMalloc((void**) &O_d, cnt*sizeof(float)));
         gpuAssert(cudaMalloc((void**) &V_d, cnt*sizeof(float)));
@@ -286,25 +346,19 @@ int main(int argc, char **argv)
         gpuAssert(cudaMalloc((void**) &m_d, (size_t)N*sizeof(float)));
         gpuAssert(cudaMalloc((void**) &l_d, (size_t)N*sizeof(float)));
 
-        // copy host memory to device
         gpuAssert(cudaMemcpy(Q_d, Q, cnt*sizeof(float), cudaMemcpyHostToDevice));
         gpuAssert(cudaMemcpy(V_d, V, cnt*sizeof(float), cudaMemcpyHostToDevice));
         gpuAssert(cudaMemcpy(K_d, K, cnt*sizeof(float), cudaMemcpyHostToDevice));
 
         fprintf(stderr, "Warming up...");
-
-        
         s2mm(m_d, l_d, O_d, Q_d, K_d, V_d, N, d);
-
-        
         gpuAssert(cudaDeviceSynchronize());
-
         fprintf(stderr, "done.\n");
-        fprintf(stderr, "Running s2mm...");
 
+        fprintf(stderr, "Running s2mm...");
         fprintf(stderr, "Printing runtimes to stdout\n");
 
-        for(int i=0; i<runs; i++) {
+        for (int it = 0; it < runs; it++) {
             gettimeofday(&ts, NULL);
             s2mm(m_d, l_d, O_d, Q_d, K_d, V_d, N, d);
             gpuAssert(cudaDeviceSynchronize());
@@ -314,7 +368,6 @@ int main(int argc, char **argv)
             printf("%f\n", dur);
         }
 
-
         gpuAssert(cudaMemcpy(O, O_d, cnt*sizeof(float), cudaMemcpyDeviceToHost));
         gpuAssert(cudaDeviceSynchronize());
 
@@ -323,12 +376,10 @@ int main(int argc, char **argv)
             status = EXIT_FAILURE;
         }
 
-        /* QK^t is 2N^2d flops, so is PV. softmax(S) (row-wise)
-         * exp(S[i]) / sum_j exp(P[i, j] - max(P[i]))
-         * is N * (N + 4N) = 5 N^2 flops, but exp is more expensive. */
+        /* QK^t is 2N^2d flops, so is PV. */
         fprintf(stderr,
                 "Compute rate: %lf Gflops/s, runtime: %lf ms\n",
-                4.0 * d * N * N / dur / 1e9,  dur*1e3);
+                4.0 * d * N * N / dur / 1e9, dur * 1e3);
 
         gpuAssert(cudaFree(Q_d));
         gpuAssert(cudaFree(K_d));
@@ -345,3 +396,4 @@ int main(int argc, char **argv)
 
     return status;
 }
+
